@@ -432,6 +432,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         })
         return
       }
+      case "question_custom": {
+        // 用户点击"✍️ 其他答案"：引导用 /answer 文本回复（#latest 即该问题）
+        await emit({
+          kind: "status",
+          sessionID: sid,
+          chatID: ctx.chatID,
+          text: "✍️ 请直接回复：`/answer <你的答案>`\n（将作为本次提问的回答）",
+        })
+        return
+      }
       case "help": {
         await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: HELP_TEXT })
         return

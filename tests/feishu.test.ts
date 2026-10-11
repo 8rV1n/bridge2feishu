@@ -111,11 +111,13 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
     questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }],
   })
   const buttons = cards[0]!.body.elements.filter((e) => e.tag === "button") as
-    | Array<{ text: { content: string }; value: { kind: string; requestID: string; label: string } }>
-  assert.ok(buttons.length === 2, "should have option buttons")
+    | Array<{ text: { content: string }; value: { kind: string; requestID: string; label?: string } }>
+  assert.ok(buttons.length === 3, "should have option buttons + ✍️ 其他答案")
   assert.equal(buttons[0]!.text.content, "A")
   assert.equal(buttons[0]!.value.kind, "question")
   assert.equal(buttons[0]!.value.requestID, "q_1")
+  assert.equal(buttons[2]!.text.content, "✍️ 其他答案")
+  assert.equal(buttons[2]!.value.kind, "question_custom")
   assert.ok(JSON.stringify(cards[0]).includes("/answer"))
 
   const cards2 = renderCardMulti({

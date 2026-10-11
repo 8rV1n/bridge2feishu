@@ -96,6 +96,9 @@ export function cardActionToCommand(value: unknown): InboundCommand | null {
   if (v.kind === "question" && typeof v.requestID === "string" && typeof v.label === "string" && v.label.trim()) {
     return { action: "question_reply", requestID: v.requestID, answers: [v.label] }
   }
+  if (v.kind === "question_custom" && typeof v.requestID === "string") {
+    return { action: "question_custom", requestID: v.requestID }
+  }
   return null
 }
 

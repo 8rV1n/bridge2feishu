@@ -270,7 +270,7 @@ function cardParts(event: OutboundEvent): {
         actions: permissionButtons(event.requestID),
       }
     case "question_asked": {
-      const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }> }> | undefined
+      const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }>; custom?: boolean }> | undefined
       const lines: string[] = []
       let actions: FeishuCardElement[] | undefined
       for (let qi = 0; qi < (qs?.length ?? 0); qi++) {
@@ -279,14 +279,20 @@ function cardParts(event: OutboundEvent): {
         const opts = (q.options ?? []).map((o) => o.label).filter(Boolean)
         if (opts.length) {
           if (qi === 0 && opts.length <= QUESTION_BUTTON_MAX) {
-            actions = opts.map((label, oi) => ({
+            const mkBtn = (content: string, type: string, value: { kind: string; requestID: string; label?: string }): FeishuButton => ({
               tag: "button",
-              text: { tag: "plain_text", content: label },
-              type: oi === 0 ? "primary" : "default",
+              text: { tag: "plain_text", content },
+              type,
               size: "medium",
               behaviors: [{ type: "callback" }],
-              value: { kind: "question", requestID: event.requestID, label },
-            }))
+              value,
+            })
+            const buttons: FeishuButton[] = opts.map((label, oi) =>
+              mkBtn(label, oi === 0 ? "primary" : "default", { kind: "question", requestID: event.requestID, label }),
+            )
+            // 自定义答案入口：点击后提示用 /answer 文本回复
+            buttons.push(mkBtn("✍️ 其他答案", "default", { kind: "question_custom", requestID: event.requestID }))
+            actions = buttons
           } else {
             lines.push(`选项：${opts.map((o) => `\`${o}\``).join(" / ")}`)
           }

@@ -50,6 +50,7 @@ export type InboundCommand =
   | { action: "question_reply"; requestID: string; answers: string[] }
   | { action: "stop" }
   | { action: "help" }
+  | { action: "question_custom"; requestID: string }
   | { action: "model_list" }
   | { action: "model_switch"; index: number }
   | { action: "agent_list" }
