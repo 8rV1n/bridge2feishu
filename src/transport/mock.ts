@@ -21,6 +21,7 @@ export class MockTransport {
   private timer: ReturnType<typeof setInterval> | null = null
   private handler: InboundHandler | null = null
   private stopped = true
+  private nextID = 1
 
   constructor(private opts: MockTransportOptions) {
     this.outboxPath = `${opts.stateDir}/outbox.jsonl`
@@ -44,8 +45,14 @@ export class MockTransport {
     }
   }
 
-  async send(event: OutboundEvent): Promise<void> {
-    appendFileSync(this.outboxPath, JSON.stringify({ ts: Date.now(), ...event }) + "\n")
+  async send(event: OutboundEvent): Promise<string | undefined> {
+    const messageID = `mock_msg_${this.nextID++}`
+    appendFileSync(this.outboxPath, JSON.stringify({ ts: Date.now(), messageID, ...event }) + "\n")
+    return messageID
+  }
+
+  async updateCard(messageID: string, card: unknown): Promise<void> {
+    appendFileSync(this.outboxPath, JSON.stringify({ ts: Date.now(), kind: "card_update", messageID, card }) + "\n")
   }
 
   onInbound(handler: InboundHandler): void {

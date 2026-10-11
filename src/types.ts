@@ -22,11 +22,13 @@ export type OutboundEvent =
       | { kind: "share_close"; sessionID: string; chatID: string; reason: string }
       | { kind: "session_snapshot"; sessionID: string; chatID: string; snapshot: SessionSnapshot }
       | { kind: "task_started"; sessionID: string; chatID: string }
+      | { kind: "task_retry"; sessionID: string; chatID: string; attempt: number; message: string }
       | { kind: "task_completed"; sessionID: string; chatID: string; summary?: string }
       | { kind: "task_failed"; sessionID: string; chatID: string; error?: string }
       | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; title?: string; ordinal?: number }
       | { kind: "question_asked"; sessionID: string; chatID: string; requestID: string; questions: unknown }
       | { kind: "status"; sessionID: string; chatID: string; text: string }
+      | { kind: "card_update"; sessionID: string; chatID: string; messageID: string; card: unknown }
     )
     & { sessionTitle?: string })
 
@@ -57,7 +59,10 @@ export type InboundCommand =
 export type FeishuTransport = {
   start(): Promise<void>
   stop(): Promise<void>
-  send(event: OutboundEvent): Promise<void>
+  /** 发送事件；lark 返回 message_id（供流式卡片更新），mock 返回生成的本地 id */
+  send(event: OutboundEvent): Promise<string | undefined>
+  /** 原地更新一张已发送卡片的内容（流式刷新） */
+  updateCard(messageID: string, card: unknown): Promise<void>
   onInbound(handler: (cmd: InboundCommand, ctx: InboundContext) => void): void
 }
 

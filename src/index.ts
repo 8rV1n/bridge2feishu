@@ -6,7 +6,7 @@ import { Security } from "./security.js"
 import { lastAssistantText, summarize, textOfMessage } from "./session.js"
 import { MockTransport } from "./transport/mock.js"
 import { createTransport } from "./transport/index.js"
-import { renderOutbound, HELP_TEXT } from "./renderer.js"
+import { renderOutbound, renderStreamingCard, HELP_TEXT } from "./renderer.js"
 
 const TEST_PROMPT = "Reply with exactly: PONG"
 
@@ -66,18 +66,68 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     return order[n - 1] ?? null
   }
 
-  const emit = async (event: OutboundEvent): Promise<void> => {
-    if (!transport) return
+  const emit = async (event: OutboundEvent): Promise<string | undefined> => {
+    if (!transport) return undefined
     // 自动注入会话摘要（卡片标题显示用）
     const withTitle: OutboundEvent =
       event.sessionID && !event.sessionTitle
         ? { ...event, sessionTitle: api.state.session.get(event.sessionID)?.title }
         : event
     try {
-      await transport.send(withTitle)
+      return await transport.send(withTitle)
     } catch (err) {
       api.ui.toast({ variant: "error", title: "feishu-share", message: `send failed: ${String(err)}` })
+      return undefined
     }
+  }
+
+  // ---- 流式任务卡（busy 发出，text delta 节流原地刷新，idle/error 定稿） ----
+  type Streaming = {
+    messageID: string
+    parts: Map<string, string>
+    lastFlush: number
+    timer: ReturnType<typeof setTimeout> | null
+  }
+  let streaming: Streaming | null = null
+  const STREAM_INTERVAL_MS = 1200
+
+  const streamingText = (): string => [...(streaming?.parts.values() ?? [])].join("\n").trim()
+
+  const flushStreaming = async (final: boolean, errText?: string): Promise<void> => {
+    if (!streaming || !transport) return
+    if (streaming.timer) {
+      clearTimeout(streaming.timer)
+      streaming.timer = null
+    }
+    streaming.lastFlush = Date.now()
+    const body = errText ?? streamingText()
+    const card =
+      final && errText
+        ? renderStreamingCard("❌ 执行失败", errText, "red")
+        : renderStreamingCard(final ? "✅ 任务完成" : "⏳ 正在处理", final ? body : `${body} ▌`, final ? "green" : "blue")
+    try {
+      await transport.updateCard(streaming.messageID, card)
+    } catch {
+      // 卡片更新失败不影响本地任务
+    }
+  }
+
+  const scheduleStreamingFlush = (): void => {
+    if (!streaming) return
+    const now = Date.now()
+    const due = streaming.lastFlush + STREAM_INTERVAL_MS
+    if (now >= due) {
+      void flushStreaming(false)
+      return
+    }
+    if (!streaming.timer) {
+      streaming.timer = setTimeout(() => void flushStreaming(false), due - now)
+    }
+  }
+
+  const closeStreaming = (): void => {
+    if (streaming?.timer) clearTimeout(streaming.timer)
+    streaming = null
   }
 
   const sharedSession = (): string | null => share.current?.sessionID ?? null
@@ -449,6 +499,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     permissionOrder.length = 0
     questionOrder.length = 0
     promptQueue.length = 0
+    closeStreaming()
     const t = transport
     transport = null
     if (t) {
@@ -468,12 +519,47 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (status.type === "busy") {
       if (busySessions.has(sessionID)) return
       busySessions.add(sessionID)
-      void emit({ kind: "task_started", sessionID, chatID })
+      closeStreaming()
+      void (async () => {
+        const messageID = await emit({ kind: "task_started", sessionID, chatID })
+        if (messageID) streaming = { messageID, parts: new Map(), lastFlush: Date.now(), timer: null }
+      })()
+      return
+    }
+    if (status.type === "retry") {
+      // 模型限流等可重试错误：反馈到飞书（流式卡原地提示，否则发一次性通知）
+      const attempt = (status as { attempt?: number }).attempt ?? 0
+      const message = String((status as { message?: string }).message ?? "rate limited")
+      if (streaming && transport) {
+        void (async () => {
+          if (!streaming || !transport) return
+          const body = `${streamingText()}\n\n⚠️ ${message}（第 ${attempt} 次重试）`
+          try {
+            await transport.updateCard(streaming.messageID, renderStreamingCard("⏳ 模型限流，自动重试中", body, "orange"))
+            streaming.lastFlush = Date.now()
+          } catch {
+            // 忽略
+          }
+        })()
+        return
+      }
+      if (busySessions.has(sessionID)) {
+        void emit({ kind: "task_retry", sessionID, chatID, attempt, message })
+      }
       return
     }
     if (status.type === "idle") {
       if (!busySessions.has(sessionID)) return
       busySessions.delete(sessionID)
+      if (streaming) {
+        // 流式卡定稿（承担 task_completed 通知，避免重复消息）
+        void (async () => {
+          await flushStreaming(true)
+          closeStreaming()
+          if (promptQueue.length > 0) await drainPromptQueue(sessionID)
+        })()
+        return
+      }
       void fetchMessages(sessionID, 5)
         .then((msgs) => emit({ kind: "task_completed", sessionID, chatID, summary: lastAssistantText(msgs as never) }))
         .catch(() => emit({ kind: "task_completed", sessionID, chatID }))
@@ -483,16 +569,34 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   })
 
+  // 流式文本刷新：累积 text delta，节流后原地更新卡片
+  api.event.on("message.part.delta", (e) => {
+    const { sessionID, partID, field, delta } = e.properties
+    if (!streaming || !share.isShared(sessionID)) return
+    if (field !== "text" || !delta) return
+    streaming.parts.set(partID, (streaming.parts.get(partID) ?? "") + delta)
+    scheduleStreamingFlush()
+  })
+
   api.event.on("session.error", (e) => {
     const sessionID = e.properties.sessionID
     if (!sessionID || !share.isShared(sessionID)) return
     busySessions.delete(sessionID)
     const err = e.properties.error as { message?: string } | undefined
+    const errMsg = String(err?.message ?? "unknown")
+    if (streaming) {
+      // 流式卡原地变红
+      void (async () => {
+        await flushStreaming(true, errMsg)
+        closeStreaming()
+      })()
+      return
+    }
     void emit({
       kind: "task_failed",
       sessionID,
       chatID: share.current?.chatID ?? "mock",
-      error: String(err?.message ?? "unknown"),
+      error: errMsg,
     })
   })
 

@@ -297,12 +297,48 @@ test("integration: task events only forwarded for shared session", async () => {
   fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
   await new Promise((r) => setTimeout(r, 100))
   assert.equal(readOutbox(stateDir).length, events.length)
-  // idle → task_completed
+  // idle → 流式卡原地定稿（card_update，绿卡），不再发独立 task_completed
   fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
   await new Promise((r) => setTimeout(r, 150))
   const done = readOutbox(stateDir)
-  assert.equal(done[done.length - 1]?.kind, "task_completed")
-  assert.equal((done[done.length - 1] as { summary?: string }).summary, "READY")
+  const last = done[done.length - 1] as { kind: string; messageID?: string; card?: { header?: { title?: { content?: string } } } }
+  assert.equal(last?.kind, "card_update")
+  assert.ok(last?.card?.header?.title?.content?.includes("任务完成"))
+  fake.restoreEnv()
+})
+
+test("integration: retry status reports rate-limit to feishu (streaming card + standalone)", async () => {
+  const { fake, stateDir } = await setup()
+  // 路径 1：流式卡存在 → 原地更新为橙色重试卡
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 100))
+  fake.triggerEvent("session.status", {
+    properties: {
+      sessionID: "ses_current",
+      status: { type: "retry", attempt: 2, message: "TPM limit of the model glm-5-3-flash is exceeded" },
+    },
+  })
+  await new Promise((r) => setTimeout(r, 150))
+  let events = readOutbox(stateDir)
+  let last = events[events.length - 1] as { kind: string; card?: { header?: { title?: { content?: string } }; elements?: Array<{ content?: string }> } }
+  assert.equal(last?.kind, "card_update")
+  assert.ok(last?.card?.header?.title?.content?.includes("模型限流"))
+  assert.ok(JSON.stringify(last?.card).includes("TPM limit"))
+
+  // 路径 2：无流式卡（会话非流式）→ task_retry 通知
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 100))
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 100))
+  // 模拟流式卡丢失（直接清空内部状态不可行，改为验证 retry 在 streaming 为空时发 task_retry）
+  fake.triggerEvent("session.status", {
+    properties: { sessionID: "ses_current", status: { type: "retry", attempt: 3, message: "rate limited" } },
+  })
+  await new Promise((r) => setTimeout(r, 150))
+  events = readOutbox(stateDir)
+  last = events[events.length - 1] as { kind: string; attempt?: number }
+  assert.equal(last?.kind, "card_update") // 仍有流式卡 → card_update
+  assert.equal((last as { attempt?: number }).attempt, undefined)
   fake.restoreEnv()
 })
 

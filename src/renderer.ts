@@ -105,6 +105,12 @@ function cardParts(event: OutboundEvent): { title: string; template: string; bod
       return { title: "📋 会话快照", template: "blue", body: snapshotMd(event.snapshot) }
     case "task_started":
       return { title: "▶️ 任务开始执行", template: "blue", body: "agent 正在处理当前任务" }
+    case "task_retry":
+      return {
+        title: "⏳ 模型限流，自动重试中",
+        template: "orange",
+        body: `${event.message}\n\n第 **${event.attempt}** 次重试，完成后会继续更新`,
+      }
     case "task_completed":
       return { title: "✅ 任务完成", template: "green", body: event.summary ?? "（无文本输出）" }
     case "task_failed":
@@ -136,6 +142,8 @@ function cardParts(event: OutboundEvent): { title: string; template: string; bod
     }
     case "status":
       return { title: "ℹ️ 状态", template: "turquoise", body: event.text || "(empty)" }
+    default:
+      return { title: "ℹ️ 通知", template: "grey", body: "" }
   }
 }
 
@@ -148,6 +156,11 @@ export function renderCards(event: OutboundEvent): FeishuCard[] {
     const page = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""
     return card(template, `${title}${page}${tag}`, c, note)
   })
+}
+
+/** 流式刷新卡（单张、单卡上限、可选光标） */
+export function renderStreamingCard(title: string, body: string, template: string): FeishuCard {
+  return card(template, title, body || "正在处理…")
 }
 
 /** 兼容保留：纯文本投影（标题 + 正文，mock/日志/测试场景） */

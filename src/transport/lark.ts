@@ -23,7 +23,14 @@ type InboundHandler = (cmd: InboundCommand, ctx: InboundContext) => void
 
 type LarkModules = {
   Client: new (params: { appId: string; appSecret: string; domain?: string }) => {
-    im: { v1: { message: { create: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string }> } } }
+    im: {
+      v1: {
+        message: {
+          create: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string; data?: { message_id?: string } }>
+          patch: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string }>
+        }
+      }
+    }
   }
   EventDispatcher: new (params: Record<string, unknown>) => {
     register: (handles: Record<string, unknown>) => { unregister: (...keys: string[]) => void }
@@ -63,7 +70,9 @@ export class ReplayGuard {
 export class LarkTransport implements FeishuTransport {
   private mod: LarkModules | null = null
   private ws: { close: (params?: { force?: boolean }) => void } | null = null
-  private imClient: { im: { v1: { message: { create: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string }> } } } } | null = null
+  private imClient: {
+    im: { v1: { message: { create: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string; data?: { message_id?: string } }>; patch: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string }> } } }
+  } | null = null
   private handler: InboundHandler | null = null
   private guard = new ReplayGuard()
   private log: (level: "info" | "error", msg: string) => void
@@ -152,9 +161,10 @@ export class LarkTransport implements FeishuTransport {
     }
   }
 
-  async send(event: OutboundEvent): Promise<void> {
+  async send(event: OutboundEvent): Promise<string | undefined> {
     if (!this.mod || !this.imClient) throw new Error("lark transport not started")
     const cards: FeishuCard[] = renderCards(event)
+    let lastMessageID: string | undefined
     for (const card of cards) {
       const res = await this.imClient.im.v1.message.create({
         params: { receive_id_type: this.opts.receiveIDType ?? "chat_id" },
@@ -167,6 +177,20 @@ export class LarkTransport implements FeishuTransport {
       if (res.code !== undefined && res.code !== 0) {
         throw new Error(`feishu send failed: ${res.code} ${res.msg}`)
       }
+      const created = res.data as { message_id?: string } | undefined
+      lastMessageID = created?.message_id
+    }
+    return lastMessageID
+  }
+
+  async updateCard(messageID: string, card: unknown): Promise<void> {
+    if (!this.mod || !this.imClient) throw new Error("lark transport not started")
+    const res = await this.imClient.im.v1.message.patch({
+      data: { content: JSON.stringify(card) },
+      path: { message_id: messageID },
+    })
+    if (res.code !== undefined && res.code !== 0) {
+      throw new Error(`feishu card update failed: ${res.code} ${res.msg}`)
     }
   }
 }
