@@ -15,6 +15,7 @@ export function createTransport(config: PluginConfig, log?: (level: "info" | "er
       chatID: config.defaultChatID,
       receiveIDType: config.receiveIDType,
       logger: log,
+      debug: process.env.FEISHU_SHARE_DEBUG === "1" ? { logFile: `${config.stateDir}/lark-sdk.log` } : undefined,
     })
   }
   return new MockTransport({ stateDir: config.stateDir })

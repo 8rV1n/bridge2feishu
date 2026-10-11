@@ -18,10 +18,37 @@ export type LarkTransportOptions = {
   chatID: string
   receiveIDType?: "chat_id" | "open_id"
   logger?: (level: "info" | "error", msg: string) => void
+  /** 调试：把 SDK 的 WS 帧/dispatcher 日志写入 <stateDir>/lark-sdk.log（FEISHU_SHARE_DEBUG=1 时开启） */
+  debug?: { logFile: string }
 }
 
 type InboundHandler = (cmd: InboundCommand, ctx: InboundContext) => void
 type CardActionHandler = (value: unknown, ctx: InboundContext, messageID?: string) => void
+
+/** SDK Logger 接口的文件实现（用于 FEISHU_SHARE_DEBUG 诊断） */
+export function createFileLogger(logFile: string): Record<string, (...args: unknown[]) => void> {
+  const write = (level: string) => (...args: unknown[]) => {
+    try {
+      const { appendFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs")
+      const { dirname } = require("node:path") as typeof import("node:path")
+      mkdirSync(dirname(logFile), { recursive: true })
+      const msg = args
+        .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+        .join(" ")
+        .slice(0, 800)
+      appendFileSync(logFile, `${new Date().toISOString()} ${level} ${msg}\n`)
+    } catch {
+      // 日志失败不影响主流程
+    }
+  }
+  return {
+    trace: write("TRACE"),
+    debug: write("DEBUG"),
+    info: write("INFO"),
+    warn: write("WARN"),
+    error: write("ERROR"),
+  }
+}
 
 /** LRU 去重集合（防飞书事件重推导致的重复执行） */
 export class ReplayGuard {
@@ -106,12 +133,14 @@ export class LarkTransport implements FeishuTransport {
     this.mod = mod
 
     const domain = this.opts.domain ?? mod.Domain?.Feishu ?? "https://open.feishu.cn"
+    const sdkLogger = this.opts.debug ? createFileLogger(this.opts.debug.logFile) : undefined
     const channel = mod.createLarkChannel({
       appId: this.opts.appId,
       appSecret: this.opts.appSecret,
       transport: "websocket",
       domain,
-      loggerLevel: "warn",
+      logger: sdkLogger,
+      loggerLevel: this.opts.debug ? "debug" : "warn",
       source: "opencode-feishu-share",
       policy: { dmMode: "open" },
     })
