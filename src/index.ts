@@ -82,19 +82,35 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   }
 
-  // ---- 流式任务卡（busy 发出，仅正文文本流式刷新，思考过程只显示"思考中"，idle/error 定稿） ----
+  // ---- 流式任务卡（busy 发出，中间过程对齐 TUI：工具时间线/思考中/正文流式，idle/error 定稿） ----
   type Streaming = {
     messageID: string
     parts: Map<string, string>
     textPartIDs: Set<string>
     reasoningActive: boolean
+    tools: Map<string, { tool: string; title: string; status: string }>
     lastFlush: number
     timer: ReturnType<typeof setTimeout> | null
   }
   let streaming: Streaming | null = null
   const STREAM_INTERVAL_MS = 1200
+  const TIMELINE_MAX = 6
 
   const streamingText = (): string => [...(streaming?.parts.values() ?? [])].join("\n").trim()
+
+  /** OpenCode 风格活动时间线（最近 N 条：✓ 完成 / ⟳ 运行中 / ✗ 失败 / … 等待） */
+  const streamingTimeline = (): string => {
+    if (!streaming || streaming.tools.size === 0) return ""
+    const entries = [...streaming.tools.values()].slice(-TIMELINE_MAX)
+    return entries
+      .map((t) => {
+        if (t.status === "completed") return `✓ ${t.title}`
+        if (t.status === "error") return `✗ ${t.title}`
+        if (t.status === "running") return `⟳ **${t.title}**`
+        return `… ${t.title}`
+      })
+      .join("\n")
+  }
 
   const flushStreaming = async (final: boolean, errText?: string): Promise<void> => {
     if (!streaming || !transport) return
@@ -104,17 +120,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
     streaming.lastFlush = Date.now()
     const text = streamingText()
-    const body =
-      errText ??
-      (text
-        ? final
-          ? text
-          : `${text} ▌`
-        : final
-          ? "（无文本输出）"
-          : streaming.reasoningActive
-            ? "🤔 思考中…"
-            : "正在处理…")
+    const timeline = streamingTimeline()
+    const segments: string[] = []
+    if (timeline) segments.push(timeline)
+    if (text) segments.push(final ? text : `${text} ▌`)
+    if (segments.length === 0) {
+      segments.push(final ? "（无文本输出）" : streaming.reasoningActive ? "🤔 思考中…" : "正在处理…")
+    } else if (!final && text && streaming.reasoningActive) {
+      segments.push("🤔 思考中…")
+    }
+    const body = errText ?? segments.join("\n\n")
     const card =
       final && errText
         ? renderStreamingCard("❌ 执行失败", errText, "red")
@@ -553,7 +568,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       closeStreaming()
       void (async () => {
         const messageID = await emit({ kind: "task_started", sessionID, chatID })
-        if (messageID) streaming = { messageID, parts: new Map(), textPartIDs: new Set(), reasoningActive: false, lastFlush: Date.now(), timer: null }
+        if (messageID)
+          streaming = {
+            messageID,
+            parts: new Map(),
+            textPartIDs: new Set(),
+            reasoningActive: false,
+            tools: new Map(),
+            lastFlush: Date.now(),
+            timer: null,
+          }
       })()
       return
     }
@@ -600,16 +624,22 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   })
 
-  // 流式刷新：只流式正文文本（type: "text"）；reasoning 只驱动"思考中"状态，不外发内容
+  // 流式刷新：正文文本流式；工具调用进活动时间线（对齐 TUI）；reasoning 只显示"思考中"
   api.event.on("message.part.updated", (e) => {
     const { sessionID, part } = e.properties
     if (!streaming || !share.isShared(sessionID)) return
-    const p = part as { id?: string; type?: string; text?: string }
+    const p = part as { id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }
     if (!p?.id) return
     if (p.type === "text") {
       streaming.textPartIDs.add(p.id)
       streaming.parts.set(p.id, p.text ?? "")
       streaming.reasoningActive = false
+      scheduleStreamingFlush()
+      return
+    }
+    if (p.type === "tool") {
+      const title = p.state?.title || p.tool || "工具"
+      streaming.tools.set(p.id, { tool: p.tool ?? "tool", title, status: p.state?.status ?? "pending" })
       scheduleStreamingFlush()
       return
     }

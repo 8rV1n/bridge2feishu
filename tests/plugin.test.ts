@@ -408,3 +408,40 @@ test("integration: streaming card shows thinking placeholder, streams only final
   assert.equal(final?.card?.header?.template, "green")
   fake.restoreEnv()
 })
+
+test("integration: streaming card matches TUI tool timeline (running/completed markers)", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 120))
+
+  // 工具运行中（对齐 TUI 的 ⟳ 转轮 + 标题）
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "t1", type: "tool", tool: "read", state: { status: "running", title: "Read src/index.ts" } } },
+  })
+  // 第一个工具完成、第二个运行中
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "t1", type: "tool", tool: "read", state: { status: "completed", title: "Read src/index.ts" } } },
+  })
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "t2", type: "tool", tool: "bash", state: { status: "running", title: "npm test" } } },
+  })
+  // 思考 + 正文
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "r1", type: "reasoning", text: "internal reasoning" } },
+  })
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "x1", type: "text", text: "测试通过！" } },
+  })
+  await new Promise((r) => setTimeout(r, 1500))
+
+  const events = readOutbox(stateDir)
+  const last = events.filter((e) => e.kind === "card_update").at(-1) as
+    | { card?: { elements?: Array<{ content?: string }> } }
+    | undefined
+  const body = JSON.stringify(last?.card)
+  assert.ok(body.includes("✓ Read src/index.ts"), "completed tool should show ✓")
+  assert.ok(body.includes("⟳ **npm test**"), "running tool should show ⟳ + bold title")
+  assert.ok(body.includes("测试通过！"), "text should stream")
+  assert.ok(!body.includes("internal reasoning"), "reasoning content must not be pushed")
+  fake.restoreEnv()
+})
