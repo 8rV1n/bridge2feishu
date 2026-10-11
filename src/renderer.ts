@@ -1,28 +1,50 @@
 import type { OutboundEvent, SessionSnapshot } from "./types.js"
 
 /**
- * 通知渲染：OutboundEvent → 飞书卡片（可能多张）。
- * - interactive 卡片（lark_md）：支持 markdown 渲染（代码块、加粗、链接），彩色标题栏
- * - 超长内容自动分段为多张卡片，标题带 (x/x)
- * - 卡片标题尾部附加会话摘要（sessionTitle，由 emit 层注入）
+ * 通知渲染：OutboundEvent → 飞书卡片（JSON 2.0，可能多张）。
+ * - 原生 markdown / table 组件（表格真渲染）/ action 按钮（behaviors: callback）
+ * - 超长内容自动分段为多张卡片，标题带 (x/x)；卡片标题尾部附加会话摘要
+ * - 超大表格（>40 行）回退为对齐代码块
  * - 状态类通知不调用任何 LLM；默认不上传敏感内容（截断、不含环境变量/文件内容）
  */
 
+export type FeishuButton = {
+  tag: "button"
+  text: { tag: "plain_text"; content: string }
+  type?: string
+  size?: string
+  behaviors: Array<{ type: "callback" }>
+  value: unknown
+}
+
+export type FeishuCardElement =
+  | { tag: "markdown"; content: string }
+  | { tag: "hr" }
+  | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
+  | { tag: "action"; actions: FeishuButton[] }
+  | {
+      tag: "table"
+      page_size: number
+      row_height: string
+      columns: Array<{ name: string; display_name: string; data_type: string }>
+      rows: Array<Record<string, string>>
+    }
+
 export type FeishuCard = {
-  config: { wide_screen_mode: boolean }
-  header: { template: string; title: { tag: "plain_text"; content: string } }
-  elements: Array<
-    | { tag: "markdown"; content: string }
-    | { tag: "hr" }
-    | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
-    | { tag: "action"; actions: Array<{ tag: "button"; text: { tag: "plain_text"; content: string }; type?: string; value: unknown }> }
-  >
+  schema: "2.0"
+  config: { update_multi: boolean }
+  header: { title: { tag: "plain_text"; content: string }; template: string }
+  body: { elements: FeishuCardElement[] }
 }
 
 /** 单张卡片 markdown 正文上限（字符） */
 const BODY_LIMIT = 1600
 /** 卡片标题中会话摘要的最大长度 */
 const SESSION_TAG_MAX = 28
+/** 超过该行数的表格回退为代码块 */
+const TABLE_MAX_ROWS = 40
+/** 表格按钮化的最大选项数 */
+const QUESTION_BUTTON_MAX = 6
 
 export const HELP_TEXT = [
   "直接发文本 = 发送 prompt（像在 TUI 里输入一样）",
@@ -43,15 +65,12 @@ function escapeLarkMd(text: string): string {
   return text.replace(/\{\{/g, "{ {")
 }
 
-/** 计算显示宽度（CJK 记 2，保证代码块内对齐） */
+// ---------- 表格解析（markdown → 原生 table 组件 / 超大回退代码块） ----------
+
 function displayWidth(s: string): number {
   let w = 0
   for (const ch of s) w += /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF\u3000-\u303F]/.test(ch) ? 2 : 1
   return w
-}
-
-function padCell(s: string, width: number): string {
-  return s + " ".repeat(Math.max(0, width - displayWidth(s)))
 }
 
 function parseTableRow(line: string): string[] {
@@ -66,107 +85,127 @@ function parseTableRow(line: string): string[] {
 const isTableRow = (line: string): boolean => /^\s*\|.*\|\s*$/.test(line)
 const isTableSeparator = (line: string): boolean => /^\s*\|[\s:|-]+\|\s*$/.test(line)
 
-/**
- * lark_md 不支持 markdown 表格：把表格块转换为等宽对齐的 code block，
- * 列宽按显示宽度计算（CJK=2），表头下加分隔线。
- */
-export function convertMarkdownTables(body: string): string {
+type Segment = { type: "md"; content: string } | { type: "table"; rows: string[][] }
+
+/** 把正文切分为 markdown 段与表格段 */
+function splitTableSegments(body: string): Segment[] {
   const lines = body.split("\n")
-  const out: string[] = []
+  const out: Segment[] = []
+  let md: string[] = []
+  const flushMd = () => {
+    if (md.length > 0) {
+      out.push({ type: "md", content: md.join("\n") })
+      md = []
+    }
+  }
   let i = 0
   while (i < lines.length) {
     const line = lines[i]!
     if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1]!)) {
+      flushMd()
       const rows: string[][] = [parseTableRow(line)]
       i += 2
       while (i < lines.length && isTableRow(lines[i]!)) {
         rows.push(parseTableRow(lines[i]!))
         i++
       }
-      const colCount = Math.max(...rows.map((r) => r.length))
-      const widths: number[] = Array.from({ length: colCount }, (_, c) =>
-        Math.max(...rows.map((r) => displayWidth(r[c] ?? ""))),
-      )
-      const fmt = (row: string[]): string =>
-        row.map((cell, c) => padCell(cell ?? "", widths[c] ?? 0)).join("  ").trimEnd()
-      const block = [
-        fmt(rows[0] ?? []),
-        rows
-          .slice(1)
-          .map(() => "─".repeat(widths.reduce((a, b) => a + b, 0) + (colCount - 1) * 2))
-          .join("  "),
-        ...rows.slice(1).map((r) => fmt(r)),
-      ]
-      out.push("```text", ...block, "```")
+      out.push({ type: "table", rows })
       continue
     }
-    out.push(line)
+    md.push(line)
     i++
   }
-  return out.join("\n")
+  flushMd()
+  return out
 }
 
-/** 按行聚合分段；单行超限做字符硬切；保证每段不超过 limit */
-export function splitContent(body: string, limit = BODY_LIMIT): string[] {
-  if (body.length <= limit) return [body]
-  const chunks: string[] = []
-  let cur = ""
-  const push = () => {
-    if (cur) chunks.push(cur)
-    cur = ""
-  }
-  for (const line of body.split("\n")) {
-    if (line.length > limit) {
-      push()
-      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit))
-      continue
-    }
-    if (cur.length + line.length + 1 > limit) push()
-    cur = cur ? `${cur}\n${line}` : line
-  }
-  push()
-  return chunks.length > 0 ? chunks : [body.slice(0, limit)]
+/** 超大表格回退：等宽对齐代码块（CJK=2） */
+function tableToCodeBlock(rows: string[][]): string {
+  const colCount = Math.max(...rows.map((r) => r.length))
+  const widths: number[] = Array.from({ length: colCount }, (_, c) =>
+    Math.max(...rows.map((r) => displayWidth(r[c] ?? ""))),
+  )
+  const fmt = (row: string[]): string => row.map((cell, c) => (cell ?? "") + " ".repeat(Math.max(0, (widths[c] ?? 0) - displayWidth(cell ?? "")))).join("  ").trimEnd()
+  return ["```text", fmt(rows[0] ?? []), ...rows.slice(1).map((r) => fmt(r)), "```"].join("\n")
 }
 
-function card(template: string, title: string, body: string, note?: string): FeishuCard {
-  const elements: FeishuCard["elements"] = [{ tag: "markdown", content: escapeLarkMd(convertMarkdownTables(body)) }]
+/** 代码块内的 `{{` 同样需要转义，避免触发卡片变量 */
+function codeBlock(text: string): string {
+  return ["```text", escapeLarkMd(text), "```"].join("\n")
+}
+
+function segmentToElements(seg: Segment): FeishuCardElement[] {
+  if (seg.type === "md") {
+    const content = escapeLarkMd(seg.content.trim())
+    return content ? [{ tag: "markdown", content }] : []
+  }
+  const rows = seg.rows
+  if (rows.length < 2) {
+    // 只有表头（流式中常见）或空表 → 单行 markdown
+    return rows.length === 1 ? [{ tag: "markdown", content: codeBlock(rows[0]!.join("  ")) }] : []
+  }
+  if (rows.length - 1 > TABLE_MAX_ROWS) {
+    return [{ tag: "markdown", content: codeBlock(tableToCodeBlock(rows)) }]
+  }
+  const header = rows[0]!
+  const columns = header.map((h, i) => ({ name: `c${i}`, display_name: h || `列 ${i + 1}`, data_type: "text" }))
+  const dataRows = rows.slice(1).map((r) => Object.fromEntries(columns.map((c, i) => [c.name, r[i] ?? ""])))
+  return [
+    {
+      tag: "table",
+      page_size: 10,
+      row_height: "low",
+      columns,
+      rows: dataRows,
+    },
+  ]
+}
+
+function segmentListToElements(segments: Segment[]): FeishuCardElement[] {
+  return segments.flatMap((s) => segmentToElements(s))
+}
+
+// ---------- 通用卡片构造 ----------
+
+function makeCard(
+  template: string,
+  title: string,
+  bodySegments: Segment[],
+  note?: string,
+  actions?: FeishuCardElement,
+): FeishuCard {
+  // md 段内容内再做一次表格切分（上游按字符分段可能把表格留在 md 段里）
+  const elements = bodySegments.flatMap((s) =>
+    s.type === "md" ? segmentListToElements(splitTableSegments(s.content)) : segmentToElements(s),
+  )
+  if (actions) elements.push(actions)
   if (note) elements.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
   return {
-    config: { wide_screen_mode: true },
-    header: { template, title: { tag: "plain_text", content: title } },
-    elements,
+    schema: "2.0",
+    config: { update_multi: true },
+    header: { title: { tag: "plain_text", content: title }, template },
+    body: { elements },
   }
 }
 
 /** 点击后把原卡片替换为已处理状态（按钮不可再点） */
 export function renderProcessedCard(kind: string, detail: string, operator: string): FeishuCard {
-  return card("grey", `✅ 已处理 · ${kind}`, `${detail}\n\n处理人：${operator}`)
+  return makeCard("grey", `✅ 已处理 · ${kind}`, [{ type: "md", content: `${detail}\n\n处理人：${operator}` }])
 }
 
 /** 权限审批按钮行 */
-function permissionButtons(requestID: string): FeishuCard["elements"][number] {
+function permissionButtons(requestID: string): FeishuCardElement {
+  const btn = (content: string, type: string, reply: string): FeishuButton => ({
+    tag: "button",
+    text: { tag: "plain_text", content },
+    type,
+    size: "medium",
+    behaviors: [{ type: "callback" }],
+    value: { kind: "permission", requestID, reply },
+  })
   return {
     tag: "action",
-    actions: [
-      {
-        tag: "button",
-        text: { tag: "plain_text", content: "批准一次" },
-        type: "primary",
-        value: { kind: "permission", requestID, reply: "once" },
-      },
-      {
-        tag: "button",
-        text: { tag: "plain_text", content: "永久批准" },
-        type: "default",
-        value: { kind: "permission", requestID, reply: "always" },
-      },
-      {
-        tag: "button",
-        text: { tag: "plain_text", content: "拒绝" },
-        type: "danger",
-        value: { kind: "permission", requestID, reply: "reject" },
-      },
-    ],
+    actions: [btn("批准一次", "primary", "once"), btn("永久批准", "default", "always"), btn("拒绝", "danger", "reject")],
   }
 }
 
@@ -193,7 +232,7 @@ function cardParts(event: OutboundEvent): {
   template: string
   body: string
   note?: string
-  actions?: FeishuCard["elements"][number]
+  actions?: FeishuCardElement
 } {
   switch (event.kind) {
     case "share_open":
@@ -237,19 +276,21 @@ function cardParts(event: OutboundEvent): {
     case "question_asked": {
       const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }> }> | undefined
       const lines: string[] = []
-      let actions: FeishuCard["elements"][number] | undefined
+      let actions: FeishuCardElement | undefined
       for (let qi = 0; qi < (qs?.length ?? 0); qi++) {
         const q = qs![qi]!
         if (q.question) lines.push(q.question)
         const opts = (q.options ?? []).map((o) => o.label).filter(Boolean)
         if (opts.length) {
-          if (qi === 0 && opts.length <= 6) {
+          if (qi === 0 && opts.length <= QUESTION_BUTTON_MAX) {
             actions = {
               tag: "action",
               actions: opts.map((label, oi) => ({
                 tag: "button",
                 text: { tag: "plain_text", content: label },
                 type: oi === 0 ? "primary" : "default",
+                size: "medium",
+                behaviors: [{ type: "callback" }],
                 value: { kind: "question", requestID: event.requestID, label },
               })),
             }
@@ -274,6 +315,28 @@ function cardParts(event: OutboundEvent): {
   }
 }
 
+/** 按行聚合分段；单行超限做字符硬切；保证每段不超过 limit */
+export function splitContent(body: string, limit = BODY_LIMIT): string[] {
+  if (body.length <= limit) return [body]
+  const chunks: string[] = []
+  let cur = ""
+  const push = () => {
+    if (cur) chunks.push(cur)
+    cur = ""
+  }
+  for (const line of body.split("\n")) {
+    if (line.length > limit) {
+      push()
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit))
+      continue
+    }
+    if (cur.length + line.length + 1 > limit) push()
+    cur = cur ? `${cur}\n${line}` : line
+  }
+  push()
+  return chunks.length > 0 ? chunks : [body.slice(0, limit)]
+}
+
 /** 渲染为一张或多张卡片（超长正文分段，标题带 (x/x) 与会话摘要） */
 export function renderCards(event: OutboundEvent): FeishuCard[] {
   const { title, template, body, note, actions } = cardParts(event)
@@ -281,21 +344,20 @@ export function renderCards(event: OutboundEvent): FeishuCard[] {
   const tag = sessionTag(event)
   return chunks.map((c, i) => {
     const page = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""
-    const el: FeishuCard["elements"] = [{ tag: "markdown", content: escapeLarkMd(c) }]
     // 按钮行只放在最后一张分段卡上，保证点击时内容已完整
-    if (actions && i === chunks.length - 1) el.push(actions)
-    if (note) el.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
-    return {
-      config: { wide_screen_mode: true },
-      header: { template, title: { tag: "plain_text", content: `${title}${page}${tag}` } },
-      elements: el,
-    }
+    return makeCard(
+      template,
+      `${title}${page}${tag}`,
+      [{ type: "md", content: c }],
+      i === chunks.length - 1 ? note : undefined,
+      i === chunks.length - 1 ? actions : undefined,
+    )
   })
 }
 
-/** 流式刷新卡（单张、单卡上限、可选光标）；表格同样转换 */
+/** 流式刷新卡（单张） */
 export function renderStreamingCard(title: string, body: string, template: string): FeishuCard {
-  return card(template, title, body || "正在处理…")
+  return makeCard(template, title, [{ type: "md", content: body || "正在处理…" }])
 }
 
 /** 兼容保留：纯文本投影（标题 + 正文，mock/日志/测试场景） */
@@ -303,8 +365,13 @@ export function renderOutbound(event: OutboundEvent): string {
   const cards = renderCards(event)
   return cards
     .map((c) => {
-      const body = c.elements
-        .map((e) => ("content" in e ? e.content : "elements" in e ? e.elements.map((x) => x.content).join("") : ""))
+      const body = c.body.elements
+        .map((e) => {
+          if (e.tag === "markdown") return e.content
+          if (e.tag === "note") return e.elements.map((x) => x.content).join("")
+          if (e.tag === "table") return e.columns.map((col) => col.display_name).join(" | ")
+          return ""
+        })
         .join("\n")
       return [c.header.title.content, body].filter(Boolean).join("\n")
     })
