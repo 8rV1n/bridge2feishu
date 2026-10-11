@@ -11,6 +11,7 @@ dist/
 
 # 日志与临时产物
 *.log
+*.tgz
 feishu-state/
 audit.jsonl
 outbox.jsonl

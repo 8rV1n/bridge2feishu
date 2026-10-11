@@ -1,7 +1,7 @@
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 
 export const PLUGIN_ID = "opencode-feishu-share"
-export const PLUGIN_VERSION = "0.1.0-poc"
+export const PLUGIN_VERSION = "0.1.0"
 
 export type ShareStatus = "unshared" | "shared"
 
