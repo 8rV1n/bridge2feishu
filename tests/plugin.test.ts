@@ -361,3 +361,50 @@ test("integration: abort command calls session.abort", async () => {
   assert.deepEqual((aborts[0]!.args as { sessionID: string }).sessionID, "ses_current")
   fake.restoreEnv()
 })
+
+test("integration: streaming card shows thinking placeholder, streams only final text (not reasoning)", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 120))
+  let events = readOutbox(stateDir)
+  const taskStarted = events.find((e) => e.kind === "task_started") as { messageID?: string }
+  assert.ok(taskStarted?.messageID, "busy should create a streaming card")
+
+  // reasoning 更新：不应外发思考内容，只显示"思考中"
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "p_reason", type: "reasoning", text: "secret reasoning chain..." } },
+  })
+  await new Promise((r) => setTimeout(r, 1400))
+  events = readOutbox(stateDir)
+  const thinkUpdate = events.filter((e) => e.kind === "card_update").at(-1) as {
+    messageID?: string
+    card?: { elements?: Array<{ content?: string }> }
+  }
+  assert.equal(thinkUpdate?.messageID, taskStarted?.messageID)
+  const thinkBody = JSON.stringify(thinkUpdate?.card)
+  assert.ok(thinkBody.includes("思考中"))
+  assert.ok(!thinkBody.includes("secret reasoning chain"), "reasoning content must not be pushed")
+
+  // 正文更新：流式推送最终文本
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "p_text", type: "text", text: "最终答案内容" } },
+  })
+  await new Promise((r) => setTimeout(r, 1400))
+  events = readOutbox(stateDir)
+  const textUpdate = events.filter((e) => e.kind === "card_update").at(-1) as {
+    messageID?: string
+    card?: { elements?: Array<{ content?: string }> }
+  }
+  const body = JSON.stringify(textUpdate?.card)
+  assert.ok(body.includes("最终答案内容"), "text content should stream")
+  assert.ok(!body.includes("secret reasoning chain"), "reasoning never appears in card")
+
+  // idle → 绿色完成卡
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 200))
+  events = readOutbox(stateDir)
+  const final = events.filter((e) => e.kind === "card_update").at(-1) as { card?: { header?: { title?: { content?: string }; template?: string } } }
+  assert.ok(final?.card?.header?.title?.content?.includes("任务完成"))
+  assert.equal(final?.card?.header?.template, "green")
+  fake.restoreEnv()
+})

@@ -82,10 +82,12 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   }
 
-  // ---- 流式任务卡（busy 发出，text delta 节流原地刷新，idle/error 定稿） ----
+  // ---- 流式任务卡（busy 发出，仅正文文本流式刷新，思考过程只显示"思考中"，idle/error 定稿） ----
   type Streaming = {
     messageID: string
     parts: Map<string, string>
+    textPartIDs: Set<string>
+    reasoningActive: boolean
     lastFlush: number
     timer: ReturnType<typeof setTimeout> | null
   }
@@ -101,11 +103,22 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       streaming.timer = null
     }
     streaming.lastFlush = Date.now()
-    const body = errText ?? streamingText()
+    const text = streamingText()
+    const body =
+      errText ??
+      (text
+        ? final
+          ? text
+          : `${text} ▌`
+        : final
+          ? "（无文本输出）"
+          : streaming.reasoningActive
+            ? "🤔 思考中…"
+            : "正在处理…")
     const card =
       final && errText
         ? renderStreamingCard("❌ 执行失败", errText, "red")
-        : renderStreamingCard(final ? "✅ 任务完成" : "⏳ 正在处理", final ? body : `${body} ▌`, final ? "green" : "blue")
+        : renderStreamingCard(final ? "✅ 任务完成" : "⏳ 正在处理", body, final ? "green" : "blue")
     try {
       await transport.updateCard(streaming.messageID, card)
     } catch {
@@ -540,7 +553,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       closeStreaming()
       void (async () => {
         const messageID = await emit({ kind: "task_started", sessionID, chatID })
-        if (messageID) streaming = { messageID, parts: new Map(), lastFlush: Date.now(), timer: null }
+        if (messageID) streaming = { messageID, parts: new Map(), textPartIDs: new Set(), reasoningActive: false, lastFlush: Date.now(), timer: null }
       })()
       return
     }
@@ -587,13 +600,23 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   })
 
-  // 流式文本刷新：累积 text delta，节流后原地更新卡片
-  api.event.on("message.part.delta", (e) => {
-    const { sessionID, partID, field, delta } = e.properties
+  // 流式刷新：只流式正文文本（type: "text"）；reasoning 只驱动"思考中"状态，不外发内容
+  api.event.on("message.part.updated", (e) => {
+    const { sessionID, part } = e.properties
     if (!streaming || !share.isShared(sessionID)) return
-    if (field !== "text" || !delta) return
-    streaming.parts.set(partID, (streaming.parts.get(partID) ?? "") + delta)
-    scheduleStreamingFlush()
+    const p = part as { id?: string; type?: string; text?: string }
+    if (!p?.id) return
+    if (p.type === "text") {
+      streaming.textPartIDs.add(p.id)
+      streaming.parts.set(p.id, p.text ?? "")
+      streaming.reasoningActive = false
+      scheduleStreamingFlush()
+      return
+    }
+    if (p.type === "reasoning" && streaming.parts.size === 0) {
+      streaming.reasoningActive = true
+      scheduleStreamingFlush()
+    }
   })
 
   api.event.on("session.error", (e) => {
