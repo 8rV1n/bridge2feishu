@@ -78,7 +78,7 @@ test("renderer: long summaries are segmented into multiple cards (lossless)", ()
   assert.ok(cards.length >= 2)
   // 无损：所有分段拼接还原原文
   const joined = cards
-    .map((c) => (c.body.elements[0] as { content: string }).content)
+    .map((c) => (c.elements[0] as { content: string }).content)
     .join("")
   assert.equal(joined.replace(/\n/g, ""), "x".repeat(2000))
   for (let i = 0; i < cards.length; i++) {
@@ -110,14 +110,16 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
     requestID: "q_1",
     questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }],
   })
-  const buttons = cards[0]!.body.elements.filter((e) => e.tag === "button") as
-    | Array<{ text: { content: string }; value: { kind: string; requestID: string; label?: string } }>
-  assert.ok(buttons.length === 3, "should have option buttons + ✍️ 其他答案")
-  assert.equal(buttons[0]!.text.content, "A")
-  assert.equal(buttons[0]!.value.kind, "question")
-  assert.equal(buttons[0]!.value.requestID, "q_1")
-  assert.equal(buttons[2]!.text.content, "✍️ 其他答案")
-  assert.equal(buttons[2]!.value.kind, "question_custom")
+  const actionRow = cards[0]!.elements.find((e) => e.tag === "action") as
+    | { actions: Array<{ text: { content: string }; value: { kind: string; requestID: string; label?: string } }> }
+    | undefined
+  assert.ok(actionRow, "should have action row")
+  assert.equal(actionRow.actions.length, 3, "option buttons + ✍️ 其他答案")
+  assert.equal(actionRow.actions[0]!.text.content, "A")
+  assert.equal(actionRow.actions[0]!.value.kind, "question")
+  assert.equal(actionRow.actions[0]!.value.requestID, "q_1")
+  assert.equal(actionRow.actions[2]!.text.content, "✍️ 其他答案")
+  assert.equal(actionRow.actions[2]!.value.kind, "question_custom")
   assert.ok(JSON.stringify(cards[0]).includes("/answer"))
 
   const cards2 = renderCardMulti({
@@ -128,7 +130,7 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
     questions: [{ question: "Pick", options: Array.from({ length: 8 }, (_, i) => ({ label: `opt${i}` })) }],
   })
   const text2 = renderOutboundText({ ...cards2, kind: "question_asked", sessionID: "s", chatID: "c", requestID: "q_2", questions: [] } as never)
-  const fallback = cards2[0]!.body.elements.find((e) => e.tag === "action")
+  const fallback = cards2[0]!.elements.find((e) => e.tag === "action")
   assert.equal(fallback, undefined, ">6 options should fall back to text")
 })
 
@@ -161,7 +163,7 @@ test("renderer: card carries header template and markdown body", () => {
   assert.equal(cards.length, 1)
   const card = cards[0]!
   assert.equal(card.header.template, "green")
-  const md = card.body.elements[0] as { tag: string; content: string }
+  const md = card.elements[0] as { tag: string; content: string }
   assert.equal(md.tag, "markdown")
   assert.ok(md.content.includes("结果"))
 })
@@ -176,7 +178,7 @@ test("renderer: failure card is red, permission card is orange", () => {
 
 test("renderer: escapes {{ to avoid card variable injection", () => {
   const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "{{ x }}" })
-  const md = cards[0]!.body.elements[0] as { content: string }
+  const md = cards[0]!.elements[0] as { content: string }
   assert.ok(!md.content.includes("{{"))
   assert.ok(md.content.includes("{ {"))
 })
@@ -185,7 +187,7 @@ test("renderer: oversized body is hard-split, each card within limit", () => {
   const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "x".repeat(5000) })
   assert.ok(cards.length >= 3)
   for (const c of cards) {
-    const md = c.body.elements[0] as { content: string }
+    const md = c.elements[0] as { content: string }
     assert.ok(md.content.length <= 1700)
   }
 })
@@ -250,15 +252,15 @@ test("renderer: short events keep single card without (x/x) but with session tag
   assert.ok(cards[0]!.header.title.content.includes("My Session"))
 })
 
-test("renderer: share_open card keeps sessionID (as markdown tail, note tag unsupported in V2)", () => {
+test("renderer: share_open card keeps sessionID (as note element, supported in 1.0)", () => {
   const cards = renderCardMulti({ kind: "share_open", sessionID: "ses_abc", chatID: "c1", session: { id: "ses_abc", title: "T" } })
-  assert.ok(JSON.stringify(cards[0]!.body).includes("ses_abc"))
-  assert.ok(cards[0]!.body.elements.every((e) => e.tag !== "note"), "note tag must not be used in V2 cards")
+  assert.ok(JSON.stringify(cards[0]).includes("ses_abc"))
+  assert.ok(cards[0]!.elements.some((e) => e.tag === "note"), "1.0 cards support note elements")
 })
 
 // ---------- markdown table conversion ----------
 
-test("renderer: markdown tables render as native Feishu table elements (JSON 2.0)", () => {
+test("renderer: markdown tables convert to aligned code blocks (1.0 has no table component)", () => {
   const body = [
     "前置说明",
     "",
@@ -270,32 +272,26 @@ test("renderer: markdown tables render as native Feishu table elements (JSON 2.0
     "后置说明",
   ].join("\n")
   const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: body })
-  assert.equal(cards[0]!.schema, "2.0")
-  const els = cards[0]!.body.elements
+  assert.ok(!("schema" in cards[0]!), "1.0 card (no schema field)")
+  const els = cards[0]!.elements
+  assert.equal(els.length, 1, "table stays inline in the markdown body")
   assert.equal(els[0]!.tag, "markdown")
-  assert.ok((els[0] as { content: string }).content.includes("前置说明"))
-  const table = els[1] as {
-    tag: string
-    columns: Array<{ name: string; display_name: string; data_type: string }>
-    rows: Array<Record<string, string>>
-  }
-  assert.equal(table.tag, "table")
-  assert.deepEqual(table.columns.map((c) => c.display_name), ["模型", "费用", "状态"])
-  assert.equal(table.rows.length, 2)
-  assert.equal(table.rows[0]!.c0, "glm-5-3-flash")
-  assert.equal(table.rows[0]!.c2, "idle")
-  assert.equal(els[2]!.tag, "markdown")
-  assert.ok((els[2] as { content: string }).content.includes("后置说明"))
+  const content = (els[0] as { content: string }).content
+  assert.ok(content.includes("前置说明"))
+  assert.ok(content.includes("```text"), "table rendered as aligned code block")
+  assert.ok(content.includes("模型") && content.includes("glm-5-3-flash"))
+  assert.ok(!content.includes("|---|"), "separator row removed")
+  assert.ok(content.includes("后置说明"))
 })
 
-test("renderer: table with header only (streaming) degrades to markdown; oversized table falls back to code block", () => {
+test("renderer: table with header only (streaming) stays markdown; oversized table stays code block", () => {
   // 流式中只有表头行
   const head = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "| 模型 | 费用 |\n|---|---|" })
-  assert.ok(head[0]!.body.elements.every((e) => e.tag === "markdown"))
+  assert.ok(head[0]!.elements.every((e) => e.tag === "markdown"))
 
-  // 超大表格（>40 行）→ 代码块回退
+  // 超大表格（>40 行）→ 代码块
   const big = ["| a | b |", "|---|---|", ...Array.from({ length: 50 }, (_, i) => `| v${i} | w${i} |`)].join("\n")
   const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: big })
-  assert.ok(cards[0]!.body.elements.every((e) => e.tag === "markdown"))
-  assert.ok(JSON.stringify(cards[0]!.body).includes("```text"))
+  assert.ok(cards[0]!.elements.every((e) => e.tag === "markdown"))
+  assert.ok(JSON.stringify(cards[0]).includes("```text"))
 })

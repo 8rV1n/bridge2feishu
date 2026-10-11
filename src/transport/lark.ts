@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { FeishuTransport, InboundCommand, InboundContext, OutboundEvent } from "../types.js"
 import { parseFeishuCommand, cardActionToCommand } from "../router.js"
-import { renderCards, type FeishuCard } from "../renderer.js"
+import { renderCards, renderStreamingCard, type FeishuCard } from "../renderer.js"
 
 /**
  * 飞书官方 SDK 传输层（LarkChannel：WebSocket 长连接，无公网端口）。
@@ -222,22 +222,9 @@ export class LarkTransport implements FeishuTransport {
           // 同步应答：立即返回"处理中/引导"卡片（飞书原地替换，无 timeout）
           let respCard: FeishuCard
           if (cmd.action === "question_custom") {
-            respCard = {
-              schema: "2.0",
-              config: { update_multi: true },
-              header: { title: { tag: "plain_text", content: "✍️ 自定义回答" }, template: "grey" },
-              body: { elements: [{ tag: "markdown", content: "请直接回复：`/answer <你的答案>`\n（将作为本次提问的回答）" }] },
-            }
+            respCard = renderStreamingCard("✍️ 自定义回答", "请直接回复: /answer <你的答案>（将作为本次提问的回答）", "grey")
           } else {
-            respCard = {
-              schema: "2.0",
-              config: { update_multi: true },
-              header: {
-                title: { tag: "plain_text", content: cmd.action === "permission_reply" ? "⏳ 正在处理审批…" : "⏳ 正在提交回答…" },
-                template: "grey",
-              },
-              body: { elements: [{ tag: "markdown", content: "操作已收到，正在执行…" }] },
-            }
+            respCard = renderStreamingCard(cmd.action === "permission_reply" ? "⏳ 正在处理审批…" : "⏳ 正在提交回答…", "操作已收到，正在执行…", "grey")
           }
           // 异步执行业务（回复/置灰由 onCardAction 回调完成）
           queueMicrotask(() => this.cardActionHandler?.(value, ctx, ctx.messageID))
