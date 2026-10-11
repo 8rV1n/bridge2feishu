@@ -445,3 +445,44 @@ test("integration: streaming card matches TUI tool timeline (running/completed m
   assert.ok(!body.includes("internal reasoning"), "reasoning content must not be pushed")
   fake.restoreEnv()
 })
+
+test("integration: question tool shows waiting state (no spinner entry); prompt acks are silent", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 120))
+  // agent 调用 question 工具提问
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "q1", type: "tool", tool: "question", state: { status: "running" } } },
+  })
+  await new Promise((r) => setTimeout(r, 1500))
+  let events = readOutbox(stateDir)
+  const card = events.filter((e) => e.kind === "card_update").at(-1) as { card?: { elements?: Array<{ content?: string }> } }
+  const body = JSON.stringify(card?.card)
+  assert.ok(body.includes("等待你的回答"), "question pending should show waiting state")
+  assert.ok(!body.includes("⟳ **question**"), "question tool must not appear as a spinner entry")
+
+  // 忙碌时远程 prompt → 只进队列并刷新流式卡（无独立状态框）
+  fake.setStatus("busy")
+  const before = events.length
+  const { appendFileSync } = await import("node:fs")
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "qq1", command: { action: "prompt", text: "排队任务" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  events = readOutbox(stateDir)
+  assert.equal(events.filter((e) => e.kind === "status").length, 0, "no standalone status frame for queued prompt")
+  const lastCard = events.filter((e) => e.kind === "card_update").at(-1) as { card?: { elements?: Array<{ content?: string }> } }
+  assert.ok(JSON.stringify(lastCard?.card).includes("排队 prompt"), "queue depth shown inside streaming card")
+
+  // 空闲时 prompt → 无 prompt submitted 确认框
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 300))
+  // 队列 drain 提交排队的 prompt
+  const prompts = fake.clientCalls.filter((c) => c.kind === "prompt")
+  assert.equal(prompts.length, 1)
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 150))
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 200))
+  events = readOutbox(stateDir)
+  assert.equal(events.filter((e) => e.kind === "status" && JSON.stringify(e).includes("prompt submitted")).length, 0)
+  fake.restoreEnv()
+})

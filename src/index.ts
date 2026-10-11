@@ -88,6 +88,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     parts: Map<string, string>
     textPartIDs: Set<string>
     reasoningActive: boolean
+    questionPending: boolean
     tools: Map<string, { tool: string; title: string; status: string }>
     lastFlush: number
     timer: ReturnType<typeof setTimeout> | null
@@ -123,6 +124,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const timeline = streamingTimeline()
     const segments: string[] = []
     if (timeline) segments.push(timeline)
+    if (streaming.questionPending) segments.push("❓ 等待你的回答…")
+    if (promptQueue.length > 0) segments.push(`📥 排队 prompt：${promptQueue.length} 条`)
     if (text) segments.push(final ? text : `${text} ▌`)
     if (segments.length === 0) {
       segments.push(final ? "（无文本输出）" : streaming.reasoningActive ? "🤔 思考中…" : "正在处理…")
@@ -289,7 +292,6 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         continue
       }
       promptQueue.shift()
-      await emit({ kind: "status", sessionID, chatID, text: "queued prompt submitted" })
       return // 已启动一个回合，等它完成后的下一个 idle 继续
     }
   }
@@ -328,24 +330,33 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         if (!text) return
         const st = api.state.session.status(sid)?.type
         if (st === "busy" || st === "retry") {
-          // 会话忙：进入插件自管队列，idle 后自动执行（避免 durable prompt 依赖 server 默认模型）
+          // 会话忙：进入插件自管队列（流式卡显示 📥 队列行），idle 后自动执行
           promptQueue.push(text)
-          await emit({
-            kind: "status",
-            sessionID: sid,
-            chatID: ctx.chatID,
-            text: `queued (position ${promptQueue.length}); will run after current task`,
-          })
+          if (streaming) void flushStreaming(false)
+          else
+            await emit({
+              kind: "status",
+              sessionID: sid,
+              chatID: ctx.chatID,
+              text: `已加入队列（第 ${promptQueue.length} 条），当前任务结束后自动执行`,
+            })
           return
         }
         try {
+          // 空闲直接提交；不发送确认卡 —— 紧随其后的流式任务卡即是反馈
           await submitPrompt(sid, text)
-          await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: "prompt submitted" })
         } catch (err) {
           const msg = String(err)
           if (/busy/i.test(msg)) {
             promptQueue.push(text)
-            await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `queued (position ${promptQueue.length}); session turned busy` })
+            if (streaming) scheduleStreamingFlush()
+            else
+              await emit({
+                kind: "status",
+                sessionID: sid,
+                chatID: ctx.chatID,
+                text: `会话转为忙碌，已加入队列（第 ${promptQueue.length} 条）`,
+              })
           } else {
             await emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `prompt: ${msg}` })
           }
@@ -574,6 +585,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
             parts: new Map(),
             textPartIDs: new Set(),
             reasoningActive: false,
+            questionPending: false,
             tools: new Map(),
             lastFlush: Date.now(),
             timer: null,
@@ -638,7 +650,14 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       return
     }
     if (p.type === "tool") {
+      if (p.tool === "question") {
+        // 提问工具：单独的问答卡负责展示，流式卡只显示等待状态，不进时间线
+        streaming.questionPending = true
+        scheduleStreamingFlush()
+        return
+      }
       const title = p.state?.title || p.tool || "工具"
+      streaming.questionPending = false
       streaming.tools.set(p.id, { tool: p.tool ?? "tool", title, status: p.state?.status ?? "pending" })
       scheduleStreamingFlush()
       return
