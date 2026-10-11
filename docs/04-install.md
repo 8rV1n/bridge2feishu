@@ -11,17 +11,19 @@
 cd ~/OpenCodeHome/bridge2feishu
 npm install          # 安装构建与测试依赖（含飞书 SDK）
 npm run build        # 产出 dist/index.js（零运行时 npm 依赖，飞书 SDK 按需动态加载）
-npm test             # 44 个自动化测试应全部通过
+npm test             # 66 个自动化测试应全部通过
 ```
 
 ### 登记 TUI 插件（二选一）
+
+> `<repo-root>` 指本仓库根目录（即执行 `npm run build` 的目录）；插件 spec 需展开为绝对路径。
 
 **A. 项目级**（只在该项目启用）— `<project>/.opencode/tui.json`：
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["<repo-root>/dist/index.js"]
+   "plugin": ["<repo-root>/dist/index.js"]
 }
 ```
 
@@ -30,7 +32,7 @@ npm test             # 44 个自动化测试应全部通过
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["<repo-root>/dist/index.js"]
+   "plugin": ["<repo-root>/dist/index.js"]
 }
 ```
 
@@ -50,6 +52,7 @@ Mock 状态目录默认 `~/.local/share/opencode/feishu-share/`（可用 `FEISHU
 2. 输入 `/f` —— 自动补全应出现 `/feishu`
 3. 回车打开菜单 → **Share current session** → 顶部 toast「Sharing ses_… -> …」
 4. Mock 模式下检查 `~/.local/share/opencode/feishu-share/outbox.jsonl` 应出现 `share_open`
+   （卡片 JSON 2.0 结构）；任务执行期间应出现 `card_update`（流式刷新）与 `tui_input`（本地输入镜像）
 5. 向 `inbox.jsonl` 追加一行测试指令：
 
    ```bash
