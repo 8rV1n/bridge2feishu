@@ -1,6 +1,6 @@
 import type { FeishuTransport, InboundCommand, InboundContext, OutboundEvent } from "../types.js"
 import { parseFeishuCommand } from "../router.js"
-import { renderOutbound, HELP_TEXT } from "../renderer.js"
+import { renderCards, type FeishuCard } from "../renderer.js"
 
 /**
  * 飞书官方 SDK 传输层（WebSocket 长连接，无公网端口）。
@@ -154,17 +154,19 @@ export class LarkTransport implements FeishuTransport {
 
   async send(event: OutboundEvent): Promise<void> {
     if (!this.mod || !this.imClient) throw new Error("lark transport not started")
-    const text = event.kind === "status" && event.text === "__help__" ? HELP_TEXT : renderOutbound(event)
-    const res = await this.imClient.im.v1.message.create({
-      params: { receive_id_type: this.opts.receiveIDType ?? "chat_id" },
-      data: {
-        receive_id: this.opts.chatID,
-        msg_type: "text",
-        content: JSON.stringify({ text }),
-      },
-    })
-    if (res.code !== undefined && res.code !== 0) {
-      throw new Error(`feishu send failed: ${res.code} ${res.msg}`)
+    const cards: FeishuCard[] = renderCards(event)
+    for (const card of cards) {
+      const res = await this.imClient.im.v1.message.create({
+        params: { receive_id_type: this.opts.receiveIDType ?? "chat_id" },
+        data: {
+          receive_id: this.opts.chatID,
+          msg_type: "interactive",
+          content: JSON.stringify(card),
+        },
+      })
+      if (res.code !== undefined && res.code !== 0) {
+        throw new Error(`feishu send failed: ${res.code} ${res.msg}`)
+      }
     }
   }
 }

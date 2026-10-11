@@ -24,10 +24,11 @@ function makeFakeApi(env: Record<string, string> = {}) {
     onSelect: null as null | ((o: { value: string }) => void),
   }
   const disposers: Array<() => void | Promise<void>> = []
-  const sessionMessages: Array<{ info: { role: string }; parts: Array<{ type: string; text: string }> }> = [
+  const sessionMessages: Array<{ info: { role: string; modelID?: string; providerID?: string; agent?: string }; parts: Array<{ type: string; text: string }> }> = [
     { info: { role: "user" }, parts: [{ type: "text", text: "hello" }] },
-    { info: { role: "assistant" }, parts: [{ type: "text", text: "READY" }] },
+    { info: { role: "assistant", modelID: "glm-test", providerID: "ark-test", agent: "plan" }, parts: [{ type: "text", text: "READY" }] },
   ]
+  let sessionStatusType = "idle"
 
   const api = {
     app: { version: "1.18.35" },
@@ -72,7 +73,7 @@ function makeFakeApi(env: Record<string, string> = {}) {
       session: {
         get: (id: string) => (id === "ses_current" ? { id, title: "Fake Session" } : undefined),
         messages: () => [],
-        status: () => ({ type: "idle" }),
+        status: () => ({ type: sessionStatusType }),
         permission: () => [],
         question: () => [],
       },
@@ -130,6 +131,9 @@ function makeFakeApi(env: Record<string, string> = {}) {
     clientCalls,
     dialogState,
     disposers,
+    setStatus: (t: string) => {
+      sessionStatusType = t
+    },
     getSlashCommand: () => menuCommand,
     triggerEvent: (type: string, e: unknown) => {
       for (const h of eventHandlers.get(type) ?? []) h(e)
@@ -185,17 +189,39 @@ test("integration: share lifecycle emits open/close and unbinds", async () => {
   fake.restoreEnv()
 })
 
-test("integration: inbound prompt routes to shared session via durable v2 prompt", async () => {
+test("integration: inbound prompt routes to shared session with session's own model", async () => {
   const { fake, stateDir } = await setup()
-  // 从 outbox 拿 chatID（transport 已绑定）；直接注入 inbound 到已创建的 transport —— 通过 outbox 无法拿到 inbound 入口，
-  // 因此使用菜单 share 时创建的 transport。这里通过再次发送 inbox 文件验证。
-  const { appendFileSync, writeFileSync } = await import("node:fs")
+  const { appendFileSync } = await import("node:fs")
   appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "i1", command: { action: "prompt", text: "run tests" } })}\n`)
   await new Promise((r) => setTimeout(r, 700)) // mock 轮询间隔 400ms
-  const v2 = fake.clientCalls.filter((c) => c.kind === "v2prompt")
-  assert.equal(v2.length, 1)
-  assert.deepEqual((v2[0]!.args as { sessionID: string }).sessionID, "ses_current")
-  assert.equal((v2[0]!.args as { delivery?: string }).delivery, "queue")
+  const prompts = fake.clientCalls.filter((c) => c.kind === "prompt")
+  assert.equal(prompts.length, 1)
+  const args = prompts[0]!.args as { sessionID: string; model?: { providerID: string; modelID: string }; agent?: string; parts: Array<{ type: string; text: string }> }
+  assert.equal(args.sessionID, "ses_current")
+  assert.deepEqual(args.model, { providerID: "ark-test", modelID: "glm-test" })
+  assert.equal(args.agent, "plan")
+  assert.deepEqual(args.parts, [{ type: "text", text: "run tests" }])
+  fake.restoreEnv()
+})
+
+test("integration: busy session queues prompt and drains on idle", async () => {
+  const { fake, stateDir } = await setup()
+  const { appendFileSync } = await import("node:fs")
+  fake.setStatus("busy")
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "q1", command: { action: "prompt", text: "later job" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  // busy 时不提交
+  assert.equal(fake.clientCalls.filter((c) => c.kind === "prompt").length, 0)
+
+  // 触发 busy -> idle 事件，队列应自动执行
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 100))
+  fake.setStatus("idle")
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 300))
+  const prompts = fake.clientCalls.filter((c) => c.kind === "prompt")
+  assert.equal(prompts.length, 1)
+  assert.equal(((prompts[0]!.args as { parts: Array<{ text: string }> }).parts[0] as { text: string }).text, "later job")
   fake.restoreEnv()
 })
 
@@ -205,9 +231,9 @@ test("integration: concurrent prompts are both forwarded (server serializes)", a
   appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "c1", command: { action: "prompt", text: "one" } })}\n`)
   appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "c2", command: { action: "prompt", text: "two" } })}\n`)
   await new Promise((r) => setTimeout(r, 700))
-  const v2 = fake.clientCalls.filter((c) => c.kind === "v2prompt")
-  assert.equal(v2.length, 2)
-  const texts = v2.map((c) => (c.args as { prompt?: { text?: string } }).prompt?.text)
+  const prompts = fake.clientCalls.filter((c) => c.kind === "prompt")
+  assert.equal(prompts.length, 2)
+  const texts = prompts.map((c) => (c.args as { parts: Array<{ text: string }> }).parts[0]!.text)
   assert.deepEqual(texts.sort(), ["one", "two"])
   fake.restoreEnv()
 })

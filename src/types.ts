@@ -12,16 +12,23 @@ export type ShareTarget = {
   sharedAt: number
 }
 
+/**
+ * 出站事件。所有变体可附带 sessionTitle（由 emit 层自动注入），
+ * 用于飞书卡片标题显示会话摘要。
+ */
 export type OutboundEvent =
-  | { kind: "share_open"; sessionID: string; chatID: string; session?: SessionSnapshot }
-  | { kind: "share_close"; sessionID: string; chatID: string; reason: string }
-  | { kind: "session_snapshot"; sessionID: string; chatID: string; snapshot: SessionSnapshot }
-  | { kind: "task_started"; sessionID: string; chatID: string }
-  | { kind: "task_completed"; sessionID: string; chatID: string; summary?: string }
-  | { kind: "task_failed"; sessionID: string; chatID: string; error?: string }
-  | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; title?: string; ordinal?: number }
-  | { kind: "question_asked"; sessionID: string; chatID: string; requestID: string; questions: unknown }
-  | { kind: "status"; sessionID: string; chatID: string; text: string }
+  | ((
+      | { kind: "share_open"; sessionID: string; chatID: string; session?: SessionSnapshot }
+      | { kind: "share_close"; sessionID: string; chatID: string; reason: string }
+      | { kind: "session_snapshot"; sessionID: string; chatID: string; snapshot: SessionSnapshot }
+      | { kind: "task_started"; sessionID: string; chatID: string }
+      | { kind: "task_completed"; sessionID: string; chatID: string; summary?: string }
+      | { kind: "task_failed"; sessionID: string; chatID: string; error?: string }
+      | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; title?: string; ordinal?: number }
+      | { kind: "question_asked"; sessionID: string; chatID: string; requestID: string; questions: unknown }
+      | { kind: "status"; sessionID: string; chatID: string; text: string }
+    )
+    & { sessionTitle?: string })
 
 export type SessionSnapshot = {
   id: string
@@ -41,6 +48,10 @@ export type InboundCommand =
   | { action: "question_reply"; requestID: string; answers: string[] }
   | { action: "stop" }
   | { action: "help" }
+  | { action: "model_list" }
+  | { action: "model_switch"; index: number }
+  | { action: "agent_list" }
+  | { action: "agent_switch"; index: number }
 
 /** 飞书（或 Mock）传输层接口：TUI → 飞书 为 send/update，飞书 → TUI 为 inbound 回调 */
 export type FeishuTransport = {

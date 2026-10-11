@@ -24,6 +24,38 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const pendingQuestions = new Map<string, unknown>()
   const permissionOrder: string[] = []
   const questionOrder: string[] = []
+  // 会话忙时的远程 prompt 队列（对齐 TUI 本地排队语义）
+  const promptQueue: string[] = []
+  // /model 与 /agent 的列表缓存（保证 list 与 switch 编号一致性）
+  let modelCache: Array<{ providerID: string; modelID: string; label: string }> = []
+  let agentCache: Array<{ name: string; label: string }> = []
+
+  const listModels = (): Array<{ providerID: string; modelID: string; label: string }> => {
+    if (modelCache.length > 0) return modelCache
+    const out: Array<{ providerID: string; modelID: string; label: string }> = []
+    for (const provider of api.state.provider ?? []) {
+      for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+        out.push({ providerID: provider.id, modelID, label: `${provider.id}/${modelID}（${model.name}）` })
+      }
+    }
+    modelCache = out
+    return out
+  }
+
+  const listAgents = async (): Promise<Array<{ name: string; label: string }>> => {
+    if (agentCache.length > 0) return agentCache
+    const res = await api.client.v2.agent.list()
+    const agents = (res.error === undefined ? (res.data ?? []) : []) as Array<{
+      name: string
+      description?: string
+      mode?: string
+      hidden?: boolean
+    }>
+    agentCache = agents
+      .filter((a) => !a.hidden && a.mode !== "subagent")
+      .map((a) => ({ name: a.name, label: a.description ? `${a.name}（${a.description}）` : a.name }))
+    return agentCache
+  }
 
   /** 将 "#latest"/"#n" 选择器解析为真实 requestID */
   const resolveSelector = (selector: string, order: string[]): string | null => {
@@ -36,8 +68,13 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   const emit = async (event: OutboundEvent): Promise<void> => {
     if (!transport) return
+    // 自动注入会话摘要（卡片标题显示用）
+    const withTitle: OutboundEvent =
+      event.sessionID && !event.sessionTitle
+        ? { ...event, sessionTitle: api.state.session.get(event.sessionID)?.title }
+        : event
     try {
-      await transport.send(event)
+      await transport.send(withTitle)
     } catch (err) {
       api.ui.toast({ variant: "error", title: "feishu-share", message: `send failed: ${String(err)}` })
     }
@@ -71,13 +108,111 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   }
 
   const buildStatusText = async (sessionID: string): Promise<string> => {
-    const snap = await buildSnapshot(sessionID)
-    return [
-      `session: ${snap.title ?? snap.id}`,
-      `status: ${snap.status}`,
-      `messages: ${snap.messageCount}`,
-      snap.lastAssistantText ? `last: ${snap.lastAssistantText.slice(0, 200)}` : "last: (empty)",
-    ].join("\n")
+    // 对齐 TUI 右侧栏/底栏的上下文信息：模型、agent、Context tokens、费用、文件变更、待办
+    let lastAssistant:
+      | {
+          role?: string
+          modelID?: string
+          providerID?: string
+          agent?: string
+          cost?: number
+          tokens?: { total?: number; input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+        }
+      | undefined
+    try {
+      const msgs = await fetchMessages(sessionID, 10)
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const info = msgs[i]?.info as typeof lastAssistant
+        if (info?.role === "assistant") {
+          lastAssistant = info
+          break
+        }
+      }
+    } catch {
+      // 无消息
+    }
+    const session = api.state.session.get(sessionID)
+    const st = api.state.session.status(sessionID)?.type ?? "idle"
+    const files = api.state.session.diff(sessionID)
+    const todos = api.state.session.todo(sessionID)
+
+    const tok = lastAssistant?.tokens
+    const contextTokens =
+      tok?.total ?? (tok ? tok.input + tok.output + (tok.cache?.read ?? 0) + (tok.cache?.write ?? 0) + (tok.reasoning ?? 0) : undefined)
+    const fmtK = (n: number | undefined): string =>
+      n === undefined ? "?" : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
+    const doneTodos = todos.filter((t) => t.status === "completed").length
+    const addDel = files.reduce((acc, f) => ({ a: acc.a + f.additions, d: acc.d + f.deletions }), { a: 0, d: 0 })
+
+    const lines = [
+      `**模型**：${lastAssistant?.providerID ?? "?"}/${lastAssistant?.modelID ?? "?"}`,
+      `**Agent**：${lastAssistant?.agent ?? "?"}`,
+      `**Context**：${fmtK(contextTokens)} tokens · $${(lastAssistant?.cost ?? 0).toFixed(4)}`,
+      `**状态**：${st} · 会话：${session?.title ?? sessionID}`,
+      files.length > 0 ? `**文件变更**：${files.length} 个（+${addDel.a}/-${addDel.d}）` : null,
+      todos.length > 0 ? `**待办**：${doneTodos}/${todos.length} 完成` : null,
+      promptQueue.length > 0 ? `**排队远程 prompt**：${promptQueue.length}` : null,
+    ]
+    return lines.filter(Boolean).join("\n")
+  }
+
+  /**
+   * 读取会话最后一条 assistant 消息携带的模型/agent，
+   * 远程 prompt 显式沿用（与 TUI 本地提交行为一致，避免 server 默认模型配置失效导致 401）。
+   */
+  const resolveSessionModel = async (
+    sessionID: string,
+  ): Promise<{ model?: { providerID: string; modelID: string }; agent?: string }> => {
+    try {
+      const msgs = await fetchMessages(sessionID, 10)
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const info = msgs[i]?.info as
+          | { role?: string; modelID?: string; providerID?: string; agent?: string }
+          | undefined
+        if (info?.role !== "assistant") continue
+        if (!info.modelID || !info.providerID) continue
+        return {
+          model: { providerID: info.providerID, modelID: info.modelID },
+          ...(typeof info.agent === "string" && info.agent ? { agent: info.agent } : {}),
+        }
+      }
+    } catch {
+      // 读取失败则不带 model（回落 server 默认）
+    }
+    return {}
+  }
+
+  /** 以经典 parts prompt 注入（消息会像本地输入一样出现在 TUI 会话中） */
+  const submitPrompt = async (sid: string, text: string): Promise<void> => {
+    const { model, agent } = await resolveSessionModel(sid)
+    const res = await api.client.session.prompt({
+      sessionID: sid,
+      ...(model ? { model } : {}),
+      ...(agent ? { agent } : {}),
+      parts: [{ type: "text", text }],
+    })
+    if (res.error !== undefined) {
+      throw new Error(JSON.stringify(res.error))
+    }
+  }
+
+  /** 会话空闲后依次执行排队的远程 prompt */
+  const drainPromptQueue = async (sessionID: string): Promise<void> => {
+    const chatID = share.current?.chatID ?? ""
+    while (promptQueue.length > 0) {
+      const text = promptQueue[0]!
+      try {
+        await submitPrompt(sessionID, text)
+      } catch (err) {
+        if (/busy/i.test(String(err))) return // 又忙了，等下一个 idle
+        promptQueue.shift()
+        await emit({ kind: "task_failed", sessionID, chatID, error: `queued prompt: ${String(err)}` })
+        continue
+      }
+      promptQueue.shift()
+      await emit({ kind: "status", sessionID, chatID, text: "queued prompt submitted" })
+      return // 已启动一个回合，等它完成后的下一个 idle 继续
+    }
   }
 
   // ---- 入站命令处理（飞书 → TUI） ----
@@ -112,18 +247,30 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       case "prompt": {
         const text = (cmd.text ?? "").trim()
         if (!text) return
-        // 使用 v2 durable prompt：busy 时按 delivery 语义 steer/queue，不会 SessionBusyError
-        void api.client.v2.session
-          .prompt({ sessionID: sid, prompt: { text }, delivery: cmd.delivery ?? "queue" })
-          .then((res) => {
-            if (res.error !== undefined) {
-              return emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `prompt: ${JSON.stringify(res.error)}` })
-            }
-            return emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `prompt accepted (${cmd.delivery ?? "queue"})` })
+        const st = api.state.session.status(sid)?.type
+        if (st === "busy" || st === "retry") {
+          // 会话忙：进入插件自管队列，idle 后自动执行（避免 durable prompt 依赖 server 默认模型）
+          promptQueue.push(text)
+          await emit({
+            kind: "status",
+            sessionID: sid,
+            chatID: ctx.chatID,
+            text: `queued (position ${promptQueue.length}); will run after current task`,
           })
-          .catch((err) => {
-            void emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `prompt: ${String(err)}` })
-          })
+          return
+        }
+        try {
+          await submitPrompt(sid, text)
+          await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: "prompt submitted" })
+        } catch (err) {
+          const msg = String(err)
+          if (/busy/i.test(msg)) {
+            promptQueue.push(text)
+            await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `queued (position ${promptQueue.length}); session turned busy` })
+          } else {
+            await emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `prompt: ${msg}` })
+          }
+        }
         return
       }
       case "status": {
@@ -195,6 +342,56 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: HELP_TEXT })
         return
       }
+      case "model_list": {
+        const entries = listModels()
+        const { model: current } = await resolveSessionModel(sid)
+        const cur = current ? `${current.providerID}/${current.modelID}` : "(未知)"
+        const text = [`**当前模型**：${cur}`, "", ...entries.map((m, i) => `**${i + 1}.** ${m.label}`)].join("\n")
+        await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: text.slice(0, 3000) })
+        return
+      }
+      case "model_switch": {
+        const entries = listModels()
+        const target = entries[cmd.index - 1]
+        if (!target) {
+          await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `rejected: 模型序号 ${cmd.index} 不存在（先发 /model 查看列表）` })
+          return
+        }
+        const res = await api.client.v2.session.switchModel({
+          sessionID: sid,
+          model: { id: target.modelID, providerID: target.providerID },
+        })
+        await emit({
+          kind: "status",
+          sessionID: sid,
+          chatID: ctx.chatID,
+          text: res.error !== undefined ? `切换失败: ${JSON.stringify(res.error)}` : `已切换模型 → ${target.label}`,
+        })
+        return
+      }
+      case "agent_list": {
+        const entries = await listAgents()
+        const current = (await resolveSessionModel(sid)).agent
+        const text = [`**当前 Agent**：${current ?? "(未知)"}`, "", ...entries.map((a, i) => `**${i + 1}.** ${a.label}`)].join("\n")
+        await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: text.slice(0, 3000) })
+        return
+      }
+      case "agent_switch": {
+        const entries = await listAgents()
+        const target = entries[cmd.index - 1]
+        if (!target) {
+          await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `rejected: Agent 序号 ${cmd.index} 不存在（先发 /agent 查看列表）` })
+          return
+        }
+        const res = await api.client.v2.session.switchAgent({ sessionID: sid, agent: target.name })
+        await emit({
+          kind: "status",
+          sessionID: sid,
+          chatID: ctx.chatID,
+          text: res.error !== undefined ? `切换失败: ${JSON.stringify(res.error)}` : `已切换 Agent → ${target.label}`,
+        })
+        return
+      }
       case "stop": {
         stopSharing("remote stop")
         return
@@ -251,6 +448,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     pendingQuestions.clear()
     permissionOrder.length = 0
     questionOrder.length = 0
+    promptQueue.length = 0
     const t = transport
     transport = null
     if (t) {
@@ -279,6 +477,9 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       void fetchMessages(sessionID, 5)
         .then((msgs) => emit({ kind: "task_completed", sessionID, chatID, summary: lastAssistantText(msgs as never) }))
         .catch(() => emit({ kind: "task_completed", sessionID, chatID }))
+        .finally(() => {
+          if (promptQueue.length > 0) void drainPromptQueue(sessionID)
+        })
     }
   })
 

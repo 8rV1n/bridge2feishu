@@ -40,6 +40,16 @@ export class ShareStateManager {
     return { ok: true, was }
   }
 
+  /**
+   * 切换绑定到另一个会话（为未来 /switch 功能预留）。
+   * 语义：解绑旧会话、绑定新会话；调用层负责向旧目标发 share_close、向新目标发 share_open。
+   */
+  rebind(sessionID: string, chatID: string): { ok: true; previous: ShareTarget | null } {
+    const previous = this.target
+    this.target = { sessionID, chatID, sharedAt: Date.now() }
+    return { ok: true, previous }
+  }
+
   /** 远程命令只允许操作被分享的会话 */
   routeCommand(sessionID: string): boolean {
     return this.target?.sessionID === sessionID

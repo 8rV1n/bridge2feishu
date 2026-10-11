@@ -1,8 +1,9 @@
 import type { InboundCommand, InboundContext } from "./types.js"
 
 /**
- * 飞书文本指令 → InboundCommand。
- * 支持指令（大小写不敏感，@机器人 mention 自动剥离）：
+ * 飞书消息 → InboundCommand。
+ * 默认行为：**纯文本直接作为 prompt**（像在 TUI 里直接输入一样，busy 时排队）。
+ * 斜杠指令（大小写不敏感，@机器人 mention 自动剥离）：
  *   /help
  *   /status                      查看任务状态
  *   /recent                      查看最近执行结果
@@ -13,7 +14,7 @@ import type { InboundCommand, InboundContext } from "./types.js"
  *   /deny [n]                    拒绝待审批权限
  *   /answer <选项文本>            回答最近的交互式问题
  *   /disconnect                  断开分享（不中止本地任务）
- * 未知斜杠指令返回 null（忽略）；纯文本一律忽略，prompt 必须显式 /run。
+ * 未知斜杠指令返回 null（忽略）。
  * requestID 使用 "#latest"/"#n" 占位，由 SessionController 按待处理顺序解析。
  */
 export function parseFeishuCommand(
@@ -63,8 +64,20 @@ export function parseFeishuCommand(
     }
     case "/answer":
       return rest ? { action: "question_reply", requestID: "#latest", answers: [rest] } : null
+    case "/model": {
+      if (!rest) return { action: "model_list" }
+      const n = Number(rest.split(" ")[0])
+      return Number.isInteger(n) && n >= 1 ? { action: "model_switch", index: n } : null
+    }
+    case "/agent": {
+      if (!rest) return { action: "agent_list" }
+      const n = Number(rest.split(" ")[0])
+      return Number.isInteger(n) && n >= 1 ? { action: "agent_switch", index: n } : null
+    }
     default:
-      return null
+      // 纯文本 = 直接作为 prompt（像在 TUI 里输入一样）
+      if (head.startsWith("/")) return null
+      return { action: "prompt", text, delivery: "queue" }
   }
 }
 

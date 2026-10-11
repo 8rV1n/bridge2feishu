@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { parseFeishuCommand } from "../dist/router.js"
-import { renderOutbound, HELP_TEXT } from "../dist/renderer.js"
+import { renderCards as renderCardMulti, renderOutbound as renderOutboundText, HELP_TEXT } from "../dist/renderer.js"
 import { ReplayGuard } from "../dist/transport/lark.js"
 import type { OutboundEvent } from "../dist/types.js"
 
@@ -28,11 +28,16 @@ test("router: mention stripping", () => {
   assert.deepEqual(parseFeishuCommand("@_user_1 /run do it", mentions), { action: "prompt", text: "do it", delivery: "queue" })
 })
 
-test("router: plain text and unknown slash are ignored", () => {
-  assert.equal(parseFeishuCommand("hello world"), null)
-  assert.equal(parseFeishuCommand("/unknowncmd"), null)
+test("router: plain text is treated as a prompt (like typing in TUI)", () => {
+  assert.deepEqual(parseFeishuCommand("hello world"), { action: "prompt", text: "hello world", delivery: "queue" })
+  assert.deepEqual(parseFeishuCommand("  fix the login bug  "), { action: "prompt", text: "fix the login bug", delivery: "queue" })
   assert.equal(parseFeishuCommand(""), null)
   assert.equal(parseFeishuCommand("   "), null)
+})
+
+test("router: unknown slash commands are ignored", () => {
+  assert.equal(parseFeishuCommand("/unknowncmd"), null)
+  assert.equal(parseFeishuCommand("/run2 hi"), null)
 })
 
 test("router: /approve and /deny variants", () => {
@@ -49,10 +54,10 @@ test("router: /answer", () => {
   assert.equal(parseFeishuCommand("/answer"), null)
 })
 
-// ---------- renderOutbound ----------
+// ---------- outbound text rendering (compat wrapper) ----------
 
 test("renderer: share_open includes snapshot", () => {
-  const text = renderOutbound({
+  const text = renderOutboundText({
     kind: "share_open",
     sessionID: "s1",
     chatID: "c1",
@@ -63,19 +68,27 @@ test("renderer: share_open includes snapshot", () => {
 })
 
 test("renderer: task states", () => {
-  assert.ok(renderOutbound({ kind: "task_started", sessionID: "s", chatID: "c" }).includes("任务开始"))
-  assert.ok(renderOutbound({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "done" }).includes("done"))
-  assert.ok(renderOutbound({ kind: "task_failed", sessionID: "s", chatID: "c", error: "boom" }).includes("boom"))
+  assert.ok(renderOutboundText({ kind: "task_started", sessionID: "s", chatID: "c" }).includes("任务开始"))
+  assert.ok(renderOutboundText({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "done" }).includes("done"))
+  assert.ok(renderOutboundText({ kind: "task_failed", sessionID: "s", chatID: "c", error: "boom" }).includes("boom"))
 })
 
-test("renderer: truncates long summaries", () => {
-  const text = renderOutbound({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "x".repeat(2000) })
-  assert.ok(text.length < 900)
-  assert.ok(text.endsWith("…"))
+test("renderer: long summaries are segmented into multiple cards (lossless)", () => {
+  const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "x".repeat(2000), sessionTitle: "S" })
+  assert.ok(cards.length >= 2)
+  // 无损：所有分段拼接还原原文
+  const joined = cards
+    .map((c) => (c.elements[0] as { content: string }).content)
+    .join("")
+  assert.equal(joined.replace(/\n/g, ""), "x".repeat(2000))
+  for (let i = 0; i < cards.length; i++) {
+    assert.ok(cards[i]!.header.title.content.includes(`(${i + 1}/${cards.length})`))
+    assert.ok(cards[i]!.header.title.content.includes("S"))
+  }
 })
 
 test("renderer: permission card mentions approve/deny and ordinal", () => {
-  const text = renderOutbound({
+  const text = renderOutboundText({
     kind: "permission_requested",
     sessionID: "s",
     chatID: "c",
@@ -90,7 +103,7 @@ test("renderer: permission card mentions approve/deny and ordinal", () => {
 })
 
 test("renderer: question card lists options", () => {
-  const text = renderOutbound({
+  const text = renderOutboundText({
     kind: "question_asked",
     sessionID: "s",
     chatID: "c",
@@ -98,12 +111,12 @@ test("renderer: question card lists options", () => {
     questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }],
   })
   assert.ok(text.includes("Which?"))
-  assert.ok(text.includes("A / B"))
+  assert.ok(text.includes("`A` / `B`"))
   assert.ok(text.includes("/answer"))
 })
 
 test("renderer: no secrets in output", () => {
-  const text = renderOutbound({
+  const text = renderOutboundText({
     kind: "share_open",
     sessionID: "s1",
     chatID: "c1",
@@ -124,6 +137,42 @@ test("replay guard: dedups repeated ids", () => {
   assert.equal(g.first(undefined), true)
 })
 
+// ---------- Card rendering ----------
+
+test("renderer: card carries header template and markdown body", () => {
+  const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "# 结果\n- ok" })
+  assert.equal(cards.length, 1)
+  const card = cards[0]!
+  assert.equal(card.header.template, "green")
+  const md = card.elements[0] as { tag: string; content: string }
+  assert.equal(md.tag, "markdown")
+  assert.ok(md.content.includes("结果"))
+})
+
+test("renderer: failure card is red, permission card is orange", () => {
+  assert.equal(renderCardMulti({ kind: "task_failed", sessionID: "s", chatID: "c", error: "boom" })[0]!.header.template, "red")
+  assert.equal(
+    renderCardMulti({ kind: "permission_requested", sessionID: "s", chatID: "c", requestID: "p1", permission: "bash" })[0]!.header.template,
+    "orange",
+  )
+})
+
+test("renderer: escapes {{ to avoid card variable injection", () => {
+  const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "{{ x }}" })
+  const md = cards[0]!.elements[0] as { content: string }
+  assert.ok(!md.content.includes("{{"))
+  assert.ok(md.content.includes("{ {"))
+})
+
+test("renderer: oversized body is hard-split, each card within limit", () => {
+  const cards = renderCardMulti({ kind: "task_completed", sessionID: "s", chatID: "c", summary: "x".repeat(5000) })
+  assert.ok(cards.length >= 3)
+  for (const c of cards) {
+    const md = c.elements[0] as { content: string }
+    assert.ok(md.content.length <= 1700)
+  }
+})
+
 test("replay guard: LRU eviction at capacity", () => {
   const g = new ReplayGuard(3)
   g.first("a")
@@ -135,4 +184,57 @@ test("replay guard: LRU eviction at capacity", () => {
   // re-adding "a" evicts "b", so "c" and "d" are still remembered
   assert.equal(g.first("c"), false)
   assert.equal(g.first("d"), false)
+})
+
+// ---------- segmentation & session tag ----------
+
+import { splitContent } from "../dist/renderer.js"
+import type { OutboundEvent as OutboundEventT } from "../dist/types.js"
+
+test("renderer: splitContent aggregates lines and hard-splits oversized lines", () => {
+  const body = Array.from({ length: 200 }, (_, i) => `line-${i}-${"x".repeat(20)}`).join("\n")
+  const chunks = splitContent(body, 500)
+  assert.equal(chunks.join("\n"), body) // 无损
+  for (const c of chunks) assert.ok(c.length <= 520)
+  assert.ok(chunks.length > 1)
+})
+
+test("renderer: hard-splits a single line longer than limit", () => {
+  const chunks = splitContent("y".repeat(3000), 1000)
+  assert.equal(chunks.join(""), "y".repeat(3000))
+  for (const c of chunks) assert.ok(c.length <= 1000)
+})
+
+test("renderer: long summary produces multiple cards with (x/x) and session tag", () => {
+  const ev: OutboundEventT = {
+    kind: "task_completed",
+    sessionID: "s1",
+    chatID: "c1",
+    summary: Array.from({ length: 400 }, (_, i) => `段落第 ${i} 行的内容补充说明文字`).join("\n\n"),
+    sessionTitle: "Test message check-in",
+  }
+  const cards = renderCardMulti(ev)
+  assert.ok(cards.length >= 2)
+  for (let i = 0; i < cards.length; i++) {
+    assert.ok(cards[i]!.header.title.content.includes(`(${i + 1}/${cards.length})`))
+    assert.ok(cards[i]!.header.title.content.includes("Test message check-in"))
+  }
+})
+
+test("renderer: short events keep single card without (x/x) but with session tag", () => {
+  const cards = renderCardMulti({
+    kind: "task_started",
+    sessionID: "s1",
+    chatID: "c1",
+    sessionTitle: "My Session",
+  })
+  assert.equal(cards.length, 1)
+  assert.ok(!cards[0]!.header.title.content.includes("(1/1)"))
+  assert.ok(cards[0]!.header.title.content.includes("My Session"))
+})
+
+test("renderer: share_open card keeps sessionID note", () => {
+  const cards = renderCardMulti({ kind: "share_open", sessionID: "ses_abc", chatID: "c1", session: { id: "ses_abc", title: "T" } })
+  const noteEl = cards[0]!.elements.find((e) => e.tag === "note") as { elements: Array<{ content: string }> } | undefined
+  assert.ok(noteEl?.elements[0]!.content.includes("ses_abc"))
 })
