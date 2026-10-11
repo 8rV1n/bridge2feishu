@@ -544,6 +544,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     transport.onCardAction((value, ctx, messageID) => {
       const cmd = cardActionToCommand(value)
       if (!cmd) return
+      // question_custom 的引导卡由传输层同步返回，无需异步处理
+      if (cmd.action === "question_custom") return
       const kind = cmd.action === "permission_reply" ? "权限审批" : "问题回答"
       void (async () => {
         await handleInbound(cmd, ctx)

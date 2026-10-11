@@ -194,6 +194,61 @@ export class LarkTransport implements FeishuTransport {
     })
 
     this.channel = channel
+
+    // ---- 同步响应卡片回调（飞书要求 3s 内应答，否则显示 callback timeout） ----
+    // SDK 的 cardAction 处理走异步队列、不向飞书返回响应；这里替换 dispatcher 上的
+    // card.action.trigger 处理器：立即同步返回"处理中"卡片，业务逻辑异步执行。
+    type DispatcherLike = { handles?: Map<string, (data: unknown) => Promise<unknown>> }
+    const dispatcher = (channel as unknown as { dispatcher?: DispatcherLike }).dispatcher
+    if (dispatcher?.handles?.has("card.action.trigger")) {
+      dispatcher.handles.set("card.action.trigger", async (raw: unknown) => {
+        try {
+          const e = raw as {
+            operator?: { open_id?: string; openId?: string }
+            action?: { value?: unknown }
+            context?: { open_message_id?: string; open_chat_id?: string }
+            open_message_id?: string
+            open_chat_id?: string
+          }
+          const value = e.action?.value
+          const cmd = cardActionToCommand(value)
+          if (!cmd) return {}
+          const ctx: InboundContext = {
+            senderID: e.operator?.open_id ?? e.operator?.openId ?? "unknown",
+            chatID: e.context?.open_chat_id ?? e.open_chat_id ?? "unknown",
+            messageID: e.context?.open_message_id ?? e.open_message_id,
+          }
+          this.log("info", `card action: ${cmd.action} from ${ctx.senderID}`)
+          // 同步应答：立即返回"处理中/引导"卡片（飞书原地替换，无 timeout）
+          let respCard: FeishuCard
+          if (cmd.action === "question_custom") {
+            respCard = {
+              schema: "2.0",
+              config: { update_multi: true },
+              header: { title: { tag: "plain_text", content: "✍️ 自定义回答" }, template: "grey" },
+              body: { elements: [{ tag: "markdown", content: "请直接回复：`/answer <你的答案>`\n（将作为本次提问的回答）" }] },
+            }
+          } else {
+            respCard = {
+              schema: "2.0",
+              config: { update_multi: true },
+              header: {
+                title: { tag: "plain_text", content: cmd.action === "permission_reply" ? "⏳ 正在处理审批…" : "⏳ 正在提交回答…" },
+                template: "grey",
+              },
+              body: { elements: [{ tag: "markdown", content: "操作已收到，正在执行…" }] },
+            }
+          }
+          // 异步执行业务（回复/置灰由 onCardAction 回调完成）
+          queueMicrotask(() => this.cardActionHandler?.(value, ctx, ctx.messageID))
+          return respCard
+        } catch (err) {
+          this.log("error", `card action sync handler error: ${String(err)}`)
+          return {}
+        }
+      })
+    }
+
     await channel.connect()
     this.log("info", "lark ws connected")
   }
