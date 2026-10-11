@@ -486,3 +486,23 @@ test("integration: question tool shows waiting state (no spinner entry); prompt 
   assert.equal(events.filter((e) => e.kind === "status" && JSON.stringify(e).includes("prompt submitted")).length, 0)
   fake.restoreEnv()
 })
+
+test("integration: agent question event produces question card with buttons", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("question.asked", {
+    properties: {
+      id: "q_test_1",
+      sessionID: "ses_current",
+      questions: [{ question: "用哪个方案？", options: [{ label: "方案A" }, { label: "方案B" }] }],
+    },
+  })
+  await new Promise((r) => setTimeout(r, 200))
+  const events = readOutbox(stateDir)
+  const q = events.find((e) => e.kind === "question_asked") as
+    | { requestID?: string; questions?: unknown }
+    | undefined
+  assert.ok(q, "question_asked should be emitted")
+  assert.equal(q.requestID, "q_test_1")
+  fake.triggerEvent("question.replied", { properties: { requestID: "q_test_1" } })
+  fake.restoreEnv()
+})

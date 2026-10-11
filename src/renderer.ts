@@ -21,7 +21,7 @@ export type FeishuCardElement =
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
   | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
-  | { tag: "action"; actions: FeishuButton[] }
+  | FeishuButton
   | {
       tag: "table"
       page_size: number
@@ -172,13 +172,13 @@ function makeCard(
   title: string,
   bodySegments: Segment[],
   note?: string,
-  actions?: FeishuCardElement,
+  actions?: FeishuCardElement[],
 ): FeishuCard {
   // md 段内容内再做一次表格切分（上游按字符分段可能把表格留在 md 段里）
   const elements = bodySegments.flatMap((s) =>
     s.type === "md" ? segmentListToElements(splitTableSegments(s.content)) : segmentToElements(s),
   )
-  if (actions) elements.push(actions)
+  if (actions) elements.push(...actions)
   if (note) elements.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
   return {
     schema: "2.0",
@@ -193,8 +193,8 @@ export function renderProcessedCard(kind: string, detail: string, operator: stri
   return makeCard("grey", `✅ 已处理 · ${kind}`, [{ type: "md", content: `${detail}\n\n处理人：${operator}` }])
 }
 
-/** 权限审批按钮行 */
-function permissionButtons(requestID: string): FeishuCardElement {
+/** 权限审批按钮（JSON 2.0：button 直接作为 body 元素，不再使用 action 容器） */
+function permissionButtons(requestID: string): FeishuCardElement[] {
   const btn = (content: string, type: string, reply: string): FeishuButton => ({
     tag: "button",
     text: { tag: "plain_text", content },
@@ -203,10 +203,7 @@ function permissionButtons(requestID: string): FeishuCardElement {
     behaviors: [{ type: "callback" }],
     value: { kind: "permission", requestID, reply },
   })
-  return {
-    tag: "action",
-    actions: [btn("批准一次", "primary", "once"), btn("永久批准", "default", "always"), btn("拒绝", "danger", "reject")],
-  }
+  return [btn("批准一次", "primary", "once"), btn("永久批准", "default", "always"), btn("拒绝", "danger", "reject")]
 }
 
 function sessionTag(event: OutboundEvent): string {
@@ -232,7 +229,7 @@ function cardParts(event: OutboundEvent): {
   template: string
   body: string
   note?: string
-  actions?: FeishuCardElement
+  actions?: FeishuCardElement[]
 } {
   switch (event.kind) {
     case "share_open":
@@ -276,24 +273,21 @@ function cardParts(event: OutboundEvent): {
     case "question_asked": {
       const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }> }> | undefined
       const lines: string[] = []
-      let actions: FeishuCardElement | undefined
+      let actions: FeishuCardElement[] | undefined
       for (let qi = 0; qi < (qs?.length ?? 0); qi++) {
         const q = qs![qi]!
         if (q.question) lines.push(q.question)
         const opts = (q.options ?? []).map((o) => o.label).filter(Boolean)
         if (opts.length) {
           if (qi === 0 && opts.length <= QUESTION_BUTTON_MAX) {
-            actions = {
-              tag: "action",
-              actions: opts.map((label, oi) => ({
-                tag: "button",
-                text: { tag: "plain_text", content: label },
-                type: oi === 0 ? "primary" : "default",
-                size: "medium",
-                behaviors: [{ type: "callback" }],
-                value: { kind: "question", requestID: event.requestID, label },
-              })),
-            }
+            actions = opts.map((label, oi) => ({
+              tag: "button",
+              text: { tag: "plain_text", content: label },
+              type: oi === 0 ? "primary" : "default",
+              size: "medium",
+              behaviors: [{ type: "callback" }],
+              value: { kind: "question", requestID: event.requestID, label },
+            }))
           } else {
             lines.push(`选项：${opts.map((o) => `\`${o}\``).join(" / ")}`)
           }

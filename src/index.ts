@@ -225,12 +225,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       n === undefined ? "?" : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
     const doneTodos = todos.filter((t) => t.status === "completed").length
     const addDel = files.reduce((acc, f) => ({ a: acc.a + f.additions, d: acc.d + f.deletions }), { a: 0, d: 0 })
+    const messageCount = api.state.session.messages(sessionID).length
 
+    // 每个栏目独占一行；会话标题已在卡片头部，不再重复
     const lines = [
       `**模型**：${lastAssistant?.providerID ?? "?"}/${lastAssistant?.modelID ?? "?"}`,
       `**Agent**：${lastAssistant?.agent ?? "?"}`,
-      `**Context**：${fmtK(contextTokens)} tokens · $${(lastAssistant?.cost ?? 0).toFixed(4)}`,
-      `**状态**：${st} · 会话：${session?.title ?? sessionID}`,
+      `**Context**：${fmtK(contextTokens)} tokens`,
+      `**费用**：$${(lastAssistant?.cost ?? 0).toFixed(4)}`,
+      `**状态**：${st}`,
+      `**消息数**：${messageCount}`,
       files.length > 0 ? `**文件变更**：${files.length} 个（+${addDel.a}/-${addDel.d}）` : null,
       todos.length > 0 ? `**待办**：${doneTodos}/${todos.length} 完成` : null,
       promptQueue.length > 0 ? `**排队远程 prompt**：${promptQueue.length}` : null,
