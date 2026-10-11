@@ -85,6 +85,20 @@ export function stripMentionPlaceholders(text: string): string {
   return text.replace(/@\S+/g, " ").replace(/\s+/g, " ").trim()
 }
 
+/** 卡片按钮点击 → InboundCommand（value 由渲染时写入，格式受控） */
+export function cardActionToCommand(value: unknown): InboundCommand | null {
+  if (!value || typeof value !== "object") return null
+  const v = value as { kind?: string; requestID?: string; reply?: string; label?: string }
+  if (v.kind === "permission" && typeof v.requestID === "string") {
+    const reply = v.reply === "always" ? "always" : v.reply === "reject" ? "reject" : "once"
+    return { action: "permission_reply", requestID: v.requestID, reply }
+  }
+  if (v.kind === "question" && typeof v.requestID === "string" && typeof v.label === "string" && v.label.trim()) {
+    return { action: "question_reply", requestID: v.requestID, answers: [v.label] }
+  }
+  return null
+}
+
 export type RouterDeps = {
   parse: typeof parseFeishuCommand
 }

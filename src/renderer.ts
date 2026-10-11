@@ -12,7 +12,10 @@ export type FeishuCard = {
   config: { wide_screen_mode: boolean }
   header: { template: string; title: { tag: "plain_text"; content: string } }
   elements: Array<
-    { tag: "markdown"; content: string } | { tag: "hr" } | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
+    | { tag: "markdown"; content: string }
+    | { tag: "hr" }
+    | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
+    | { tag: "action"; actions: Array<{ tag: "button"; text: { tag: "plain_text"; content: string }; type?: string; value: unknown }> }
   >
 }
 
@@ -72,6 +75,38 @@ function card(template: string, title: string, body: string, note?: string): Fei
   }
 }
 
+/** 点击后把原卡片替换为已处理状态（按钮不可再点） */
+export function renderProcessedCard(kind: string, detail: string, operator: string): FeishuCard {
+  return card("grey", `✅ 已处理 · ${kind}`, `${detail}\n\n处理人：${operator}`)
+}
+
+/** 权限审批按钮行 */
+function permissionButtons(requestID: string): FeishuCard["elements"][number] {
+  return {
+    tag: "action",
+    actions: [
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "批准一次" },
+        type: "primary",
+        value: { kind: "permission", requestID, reply: "once" },
+      },
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "永久批准" },
+        type: "default",
+        value: { kind: "permission", requestID, reply: "always" },
+      },
+      {
+        tag: "button",
+        text: { tag: "plain_text", content: "拒绝" },
+        type: "danger",
+        value: { kind: "permission", requestID, reply: "reject" },
+      },
+    ],
+  }
+}
+
 function sessionTag(event: OutboundEvent): string {
   const t = event.sessionTitle?.trim()
   if (!t) return ""
@@ -89,8 +124,14 @@ function snapshotMd(s: SessionSnapshot): string {
     .join("\n")
 }
 
-/** 单个事件的（标题, 颜色, 正文, note） */
-function cardParts(event: OutboundEvent): { title: string; template: string; body: string; note?: string } {
+/** 单个事件的（标题, 颜色, 正文, note, 额外按钮行） */
+function cardParts(event: OutboundEvent): {
+  title: string
+  template: string
+  body: string
+  note?: string
+  actions?: FeishuCard["elements"][number]
+} {
   switch (event.kind) {
     case "share_open":
       return {
@@ -123,22 +164,45 @@ function cardParts(event: OutboundEvent): { title: string; template: string; bod
           `**权限**：${event.permission}`,
           event.title ? `**内容**：${event.title}` : null,
           "",
-          `回复 **/approve** 批准一次 · **/approve always** 永久 · **/deny** 拒绝`,
+          `也可回复 **/approve**（一次）/ **/approve always** / **/deny**`,
         ]
           .filter(Boolean)
           .join("\n"),
         note: `requestID ${event.requestID}`,
+        actions: permissionButtons(event.requestID),
       }
     case "question_asked": {
       const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }> }> | undefined
       const lines: string[] = []
-      for (const q of qs ?? []) {
+      let actions: FeishuCard["elements"][number] | undefined
+      for (let qi = 0; qi < (qs?.length ?? 0); qi++) {
+        const q = qs![qi]!
         if (q.question) lines.push(q.question)
-        const opts = (q.options ?? []).map((o) => `\`${o.label}\``).filter(Boolean)
-        if (opts.length) lines.push(`选项：${opts.join(" / ")}`)
+        const opts = (q.options ?? []).map((o) => o.label).filter(Boolean)
+        if (opts.length) {
+          if (qi === 0 && opts.length <= 6) {
+            actions = {
+              tag: "action",
+              actions: opts.map((label, oi) => ({
+                tag: "button",
+                text: { tag: "plain_text", content: label },
+                type: oi === 0 ? "primary" : "default",
+                value: { kind: "question", requestID: event.requestID, label },
+              })),
+            }
+          } else {
+            lines.push(`选项：${opts.map((o) => `\`${o}\``).join(" / ")}`)
+          }
+        }
       }
-      lines.push("", "回复 **/answer <选项文本>**")
-      return { title: "❓ Agent 需要你的回答", template: "orange", body: lines.join("\n"), note: `requestID ${event.requestID}` }
+      lines.push("", "点击按钮回答，或回复 **/answer <选项文本>**")
+      return {
+        title: "❓ Agent 需要你的回答",
+        template: "orange",
+        body: lines.join("\n"),
+        note: `requestID ${event.requestID}`,
+        actions,
+      }
     }
     case "status":
       return { title: "ℹ️ 状态", template: "turquoise", body: event.text || "(empty)" }
@@ -149,12 +213,20 @@ function cardParts(event: OutboundEvent): { title: string; template: string; bod
 
 /** 渲染为一张或多张卡片（超长正文分段，标题带 (x/x) 与会话摘要） */
 export function renderCards(event: OutboundEvent): FeishuCard[] {
-  const { title, template, body, note } = cardParts(event)
+  const { title, template, body, note, actions } = cardParts(event)
   const chunks = splitContent(body)
   const tag = sessionTag(event)
   return chunks.map((c, i) => {
     const page = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""
-    return card(template, `${title}${page}${tag}`, c, note)
+    const el: FeishuCard["elements"] = [{ tag: "markdown", content: escapeLarkMd(c) }]
+    // 按钮行只放在最后一张分段卡上，保证点击时内容已完整
+    if (actions && i === chunks.length - 1) el.push(actions)
+    if (note) el.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
+    return {
+      config: { wide_screen_mode: true },
+      header: { template, title: { tag: "plain_text", content: `${title}${page}${tag}` } },
+      elements: el,
+    }
   })
 }
 

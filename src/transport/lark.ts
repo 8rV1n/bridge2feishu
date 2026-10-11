@@ -1,5 +1,5 @@
 import type { FeishuTransport, InboundCommand, InboundContext, OutboundEvent } from "../types.js"
-import { parseFeishuCommand } from "../router.js"
+import { parseFeishuCommand, cardActionToCommand } from "../router.js"
 import { renderCards, type FeishuCard } from "../renderer.js"
 
 /**
@@ -74,6 +74,7 @@ export class LarkTransport implements FeishuTransport {
     im: { v1: { message: { create: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string; data?: { message_id?: string } }>; patch: (payload: unknown, options?: unknown) => Promise<{ code?: number; msg?: string }> } } }
   } | null = null
   private handler: InboundHandler | null = null
+  private cardActionHandler: ((value: unknown, ctx: InboundContext, messageID?: string) => void) | null = null
   private guard = new ReplayGuard()
   private log: (level: "info" | "error", msg: string) => void
 
@@ -83,6 +84,10 @@ export class LarkTransport implements FeishuTransport {
 
   onInbound(handler: InboundHandler): void {
     this.handler = handler
+  }
+
+  onCardAction(handler: (value: unknown, ctx: InboundContext, messageID?: string) => void): void {
+    this.cardActionHandler = handler
   }
 
   async start(): Promise<void> {
@@ -135,6 +140,31 @@ export class LarkTransport implements FeishuTransport {
           this.handler?.(cmd, ctx)
         } catch (err) {
           this.log("error", `inbound handler error: ${String(err)}`)
+        }
+      },
+      // 卡片按钮点击（WS 长连接以 card.action.trigger 事件推送）
+      "card.action.trigger": async (data: {
+        event_id?: string
+        context?: { open_message_id?: string; open_chat_id?: string }
+        open_message_id?: string
+        open_chat_id?: string
+        operator?: { open_id?: string }
+        action?: { value?: unknown }
+      }) => {
+        try {
+          if (!this.guard.first(data.event_id ?? `${data.context?.open_message_id ?? data.open_message_id ?? "card"}`)) return
+          const value = data.action?.value
+          const cmd = cardActionToCommand(value)
+          if (!cmd) return
+          const ctx: InboundContext = {
+            senderID: data.operator?.open_id ?? "unknown",
+            chatID: data.context?.open_chat_id ?? data.open_chat_id ?? "unknown",
+            messageID: data.context?.open_message_id ?? data.open_message_id,
+          }
+          this.log("info", `card action: ${cmd.action} from ${ctx.senderID}`)
+          this.cardActionHandler?.(value, ctx, ctx.messageID)
+        } catch (err) {
+          this.log("error", `card action handler error: ${String(err)}`)
         }
       },
     })

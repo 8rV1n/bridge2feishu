@@ -102,17 +102,34 @@ test("renderer: permission card mentions approve/deny and ordinal", () => {
   assert.ok(text.includes("bash"))
 })
 
-test("renderer: question card lists options", () => {
-  const text = renderOutboundText({
+test("renderer: question card renders option buttons (<=6) or text fallback (>6)", () => {
+  const cards = renderCardMulti({
     kind: "question_asked",
     sessionID: "s",
     chatID: "c",
     requestID: "q_1",
     questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }],
   })
-  assert.ok(text.includes("Which?"))
-  assert.ok(text.includes("`A` / `B`"))
-  assert.ok(text.includes("/answer"))
+  const actions = cards[0]!.elements.find((e) => e.tag === "action") as
+    | { actions: Array<{ text: { content: string }; value: { kind: string; requestID: string; label: string } }> }
+    | undefined
+  assert.ok(actions, "should have button row")
+  assert.equal(actions.actions.length, 2)
+  assert.equal(actions.actions[0]!.text.content, "A")
+  assert.equal(actions.actions[0]!.value.kind, "question")
+  assert.equal(actions.actions[0]!.value.requestID, "q_1")
+  assert.ok(JSON.stringify(cards[0]).includes("/answer"))
+
+  const cards2 = renderCardMulti({
+    kind: "question_asked",
+    sessionID: "s",
+    chatID: "c",
+    requestID: "q_2",
+    questions: [{ question: "Pick", options: Array.from({ length: 8 }, (_, i) => ({ label: `opt${i}` })) }],
+  })
+  const text2 = renderOutboundText({ ...cards2, kind: "question_asked", sessionID: "s", chatID: "c", requestID: "q_2", questions: [] } as never)
+  const fallback = cards2[0]!.elements.find((e) => e.tag === "action")
+  assert.equal(fallback, undefined, ">6 options should fall back to text")
 })
 
 test("renderer: no secrets in output", () => {

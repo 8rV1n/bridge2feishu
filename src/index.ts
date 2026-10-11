@@ -6,7 +6,8 @@ import { Security } from "./security.js"
 import { lastAssistantText, summarize, textOfMessage } from "./session.js"
 import { MockTransport } from "./transport/mock.js"
 import { createTransport } from "./transport/index.js"
-import { renderOutbound, renderStreamingCard, HELP_TEXT } from "./renderer.js"
+import { renderOutbound, renderStreamingCard, renderProcessedCard, HELP_TEXT } from "./renderer.js"
+import { cardActionToCommand } from "./router.js"
 
 const TEST_PROMPT = "Reply with exactly: PONG"
 
@@ -485,6 +486,23 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
     transport.onInbound((cmd, ctx) => {
       void handleInbound(cmd, ctx)
+    })
+    // 卡片按钮点击：走与文本指令相同的安全/路由路径，处理后把原卡片置为已处理状态
+    transport.onCardAction((value, ctx, messageID) => {
+      const cmd = cardActionToCommand(value)
+      if (!cmd) return
+      const kind = cmd.action === "permission_reply" ? "权限审批" : "问题回答"
+      void (async () => {
+        await handleInbound(cmd, ctx)
+        if (messageID && transport && (cmd.action === "permission_reply" || cmd.action === "question_reply")) {
+          const operator = ctx.senderID
+          const detail =
+            cmd.action === "permission_reply"
+              ? `${cmd.requestID} → ${cmd.reply}`
+              : `${cmd.requestID} → ${cmd.answers.join(", ")}`
+          await transport.updateCard(messageID, renderProcessedCard(kind, detail, operator)).catch(() => {})
+        }
+      })()
     })
     await emit({ kind: "share_open", sessionID, chatID, session: await buildSnapshot(sessionID) })
     api.ui.toast({ variant: "success", title: "feishu-share", message: `Sharing ${sessionID} -> ${chatID}` })

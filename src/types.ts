@@ -61,9 +61,11 @@ export type FeishuTransport = {
   stop(): Promise<void>
   /** 发送事件；lark 返回 message_id（供流式卡片更新），mock 返回生成的本地 id */
   send(event: OutboundEvent): Promise<string | undefined>
-  /** 原地更新一张已发送卡片的内容（流式刷新） */
+  /** 原地更新一张已发送卡片的内容（流式刷新/按钮点击后置灰） */
   updateCard(messageID: string, card: unknown): Promise<void>
   onInbound(handler: (cmd: InboundCommand, ctx: InboundContext) => void): void
+  /** 卡片按钮点击回调（value 为渲染时写入按钮的 JSON） */
+  onCardAction(handler: (value: unknown, ctx: InboundContext, messageID?: string) => void): void
 }
 
 export type InboundContext = {

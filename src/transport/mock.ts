@@ -20,6 +20,7 @@ export class MockTransport {
   private offset = 0
   private timer: ReturnType<typeof setInterval> | null = null
   private handler: InboundHandler | null = null
+  private cardActionHandler: ((value: unknown, ctx: InboundContext, messageID?: string) => void) | null = null
   private stopped = true
   private nextID = 1
 
@@ -59,6 +60,10 @@ export class MockTransport {
     this.handler = handler
   }
 
+  onCardAction(handler: (value: unknown, ctx: InboundContext, messageID?: string) => void): void {
+    this.cardActionHandler = handler
+  }
+
   private inboxSize(): number {
     try {
       return statSync(this.inboxPath).size
@@ -86,10 +91,26 @@ export class MockTransport {
     for (const line of text.split("\n")) {
       const trimmed = line.trim()
       if (!trimmed) continue
-      let parsed: { senderID?: string; chatID?: string; messageID?: string; command?: InboundCommand }
+      let parsed: {
+        senderID?: string
+        chatID?: string
+        messageID?: string
+        command?: InboundCommand
+        cardAction?: { value: unknown; clickedMessageID?: string }
+      }
       try {
         parsed = JSON.parse(trimmed)
       } catch {
+        continue
+      }
+      // 卡片按钮点击模拟
+      if (parsed.cardAction) {
+        const ctx: InboundContext = {
+          senderID: parsed.senderID ?? "unknown",
+          chatID: parsed.chatID ?? "mock",
+          messageID: parsed.cardAction.clickedMessageID,
+        }
+        this.cardActionHandler?.(parsed.cardAction.value, ctx, ctx.messageID)
         continue
       }
       const cmd = parsed.command
@@ -99,7 +120,7 @@ export class MockTransport {
         chatID: parsed.chatID ?? "mock",
         messageID: parsed.messageID,
       }
-      this.handler(cmd, ctx)
+      this.handler?.(cmd, ctx)
     }
   }
 }
