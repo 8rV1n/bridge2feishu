@@ -1,3 +1,5 @@
+import { appendFileSync, mkdirSync } from "node:fs"
+import { dirname } from "node:path"
 import type { FeishuTransport, InboundCommand, InboundContext, OutboundEvent } from "../types.js"
 import { parseFeishuCommand, cardActionToCommand } from "../router.js"
 import { renderCards, type FeishuCard } from "../renderer.js"
@@ -29,11 +31,9 @@ type CardActionHandler = (value: unknown, ctx: InboundContext, messageID?: strin
 export function createFileLogger(logFile: string): Record<string, (...args: unknown[]) => void> {
   const write = (level: string) => (...args: unknown[]) => {
     try {
-      const { appendFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs")
-      const { dirname } = require("node:path") as typeof import("node:path")
       mkdirSync(dirname(logFile), { recursive: true })
       const msg = args
-        .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+        .map((a) => (typeof a === "string" ? a : JSON.stringify(a) ?? String(a)))
         .join(" ")
         .slice(0, 800)
       appendFileSync(logFile, `${new Date().toISOString()} ${level} ${msg}\n`)
