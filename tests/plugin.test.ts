@@ -153,7 +153,14 @@ function makeCtx(senderID = "ou_tester", chatID = "mock-chat"): InboundContext {
 
 async function setup(env: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), "feishu-it-"))
-  const fake = makeFakeApi({ ...env, FEISHU_SHARE_STATE_DIR: stateDir, FEISHU_ALLOWED_OPEN_IDS: "*", FEISHU_ALLOWED_CHAT_IDS: "*" })
+  const fake = makeFakeApi({
+    ...env,
+    FEISHU_SHARE_STATE_DIR: stateDir,
+    FEISHU_ALLOWED_OPEN_IDS: "*",
+    FEISHU_ALLOWED_CHAT_IDS: "*",
+    // 隔离宿主环境：测试强制使用 mock 传输层，不受 shell 里的 FEISHU_* 影响
+    FEISHU_SHARE_TRANSPORT: "mock",
+  })
   await pluginTui(fake.api, undefined, undefined as never)
   // 触发菜单 share
   const cmd = fake.getSlashCommand()
@@ -240,7 +247,7 @@ test("integration: concurrent prompts are both forwarded (server serializes)", a
 
 test("integration: unauthorized sender is rejected (default deny)", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "feishu-it-"))
-  const fake = makeFakeApi({ FEISHU_SHARE_STATE_DIR: stateDir, FEISHU_ALLOWED_OPEN_IDS: "ou_boss", FEISHU_ALLOWED_CHAT_IDS: "*" })
+  const fake = makeFakeApi({ FEISHU_SHARE_STATE_DIR: stateDir, FEISHU_ALLOWED_OPEN_IDS: "ou_boss", FEISHU_ALLOWED_CHAT_IDS: "*", FEISHU_SHARE_TRANSPORT: "mock" })
   await pluginTui(fake.api, undefined, undefined as never)
   fake.getSlashCommand()?.run?.()
   fake.dialogState.onSelect?.({ value: "share" })
