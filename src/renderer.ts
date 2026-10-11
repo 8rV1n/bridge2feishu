@@ -24,12 +24,7 @@ export type FeishuCardElement =
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
   | FeishuButton
-  | {
-      /** 表单容器（JSON 2.0）：只能置于卡片根级 body.elements */
-      tag: "form"
-      name: string
-      elements: Array<FeishuFormInput | FeishuFormSubmitButton>
-    }
+  | FeishuForm
   | {
       tag: "table"
       page_size: number
@@ -37,6 +32,13 @@ export type FeishuCardElement =
       columns: Array<{ name: string; display_name: string; data_type: string }>
       rows: Array<Record<string, string>>
     }
+
+/** 表单容器（JSON 2.0）：只能置于卡片根级 body.elements；内嵌展示组件（markdown）+ 交互组件 */
+export type FeishuForm = {
+  tag: "form"
+  name: string
+  elements: Array<FeishuFormInput | FeishuFormSubmitButton | FeishuSelectStatic | { tag: "markdown"; content: string }>
+}
 
 /** 表单内输入框组件 */
 export type FeishuFormInput = {
@@ -59,6 +61,15 @@ export type FeishuFormSubmitButton = {
   value?: unknown
 }
 
+/** 表单内下拉选择组件（单选 select_static / 多选 multi_select_static；form_value 分别为 string / string[]） */
+export type FeishuSelectStatic = {
+  tag: "select_static" | "multi_select_static"
+  /** 表单内唯一标识；提交回调的 form_value 以此为键 */
+  name: string
+  options: Array<{ text: { tag: "plain_text"; content: string }; value: string }>
+  placeholder?: { tag: "plain_text"; content: string }
+}
+
 export type FeishuCard = {
   schema: "2.0"
   config: { update_multi: boolean }
@@ -74,6 +85,8 @@ const SESSION_TAG_MAX = 28
 const TABLE_MAX_ROWS = 40
 /** 表格按钮化的最大选项数 */
 const QUESTION_BUTTON_MAX = 6
+/** 表单下拉的最大选项数（超过则回退为输入框） */
+const QUESTION_SELECT_MAX = 20
 
 export const HELP_TEXT = [
   "直接发文本 = 发送 prompt（像在 TUI 里输入一样）",
@@ -202,11 +215,13 @@ function makeCard(
   bodySegments: Segment[],
   note?: string,
   actions?: FeishuCardElement[],
+  extraElement?: FeishuCardElement,
 ): FeishuCard {
   // md 段内容内再做一次表格切分（上游按字符分段可能把表格留在 md 段里）
   const elements = bodySegments.flatMap((s) =>
     s.type === "md" ? segmentListToElements(splitTableSegments(s.content)) : segmentToElements(s),
   )
+  if (extraElement) elements.push(extraElement)
   if (actions) elements.push(...actions)
   if (note) elements.push({ tag: "hr" }, { tag: "markdown", content: escapeLarkMd(note) })
   return {
@@ -217,9 +232,9 @@ function makeCard(
   }
 }
 
-/** 点击后把原卡片替换为已处理状态（按钮不可再点） */
-export function renderProcessedCard(kind: string, detail: string, operator: string): FeishuCard {
-  return makeCard("grey", `✅ 已处理 · ${kind}`, [{ type: "md", content: `${detail}\n\n处理人：${operator}` }])
+/** 点击后把原卡片替换为已处理状态（按钮/表单不可再提交）；detail 为精简结果，operator 可选 */
+export function renderProcessedCard(kind: string, detail: string, operator?: string): FeishuCard {
+  return makeCard("grey", `✅ 已处理 · ${kind}`, [{ type: "md", content: operator ? `${detail}\n\n处理人：${operator}` : detail }])
 }
 
 /**
@@ -292,13 +307,14 @@ function snapshotMd(s: SessionSnapshot): string {
     .join("\n")
 }
 
-/** 单个事件的（标题, 颜色, 正文, note, 额外按钮行） */
+/** 单个事件的（标题, 颜色, 正文, note, 额外按钮行, 额外表单元素） */
 function cardParts(event: OutboundEvent): {
   title: string
   template: string
   body: string
   note?: string
   actions?: FeishuCardElement[]
+  extraElement?: FeishuCardElement
 } {
   switch (event.kind) {
     case "share_open":
@@ -314,6 +330,8 @@ function cardParts(event: OutboundEvent): {
       return { title: "📋 会话快照", template: "blue", body: snapshotMd(event.snapshot) }
     case "task_started":
       return { title: "▶️ 任务开始执行", template: "blue", body: "agent 正在处理当前任务" }
+    case "task_resumed":
+      return { title: "💬 继续处理中", template: "blue", body: "已收到你的回答，agent 正在继续…" }
     case "task_retry":
       return {
         title: "⏳ 模型限流，自动重试中",
@@ -340,44 +358,90 @@ function cardParts(event: OutboundEvent): {
         actions: permissionButtons(event.requestID),
       }
     case "question_asked": {
-      const qs = event.questions as Array<{ question?: string; options?: Array<{ label: string }>; custom?: boolean }> | undefined
+      const qs = event.questions as
+        | Array<{
+            question?: string
+            header?: string
+            options?: Array<{ label?: string }>
+            multiple?: boolean
+            custom?: boolean
+          }>
+        | undefined
       const lines: string[] = []
       let actions: FeishuCardElement[] | undefined
-      for (let qi = 0; qi < (qs?.length ?? 0); qi++) {
-        const q = qs![qi]!
-        if (q.question) lines.push(q.question)
-        const opts = (q.options ?? []).map((o) => o.label).filter(Boolean)
-        if (opts.length) {
-          if (qi === 0 && opts.length <= QUESTION_BUTTON_MAX) {
-            const mkBtn = (content: string, type: string, value: { kind: string; requestID: string; label?: string }): FeishuButton => ({
-              tag: "button",
-              text: { tag: "plain_text", content },
-              type,
-              size: "medium",
-              behaviors: [{ type: "callback", value }],
+      let extraElement: FeishuCardElement | undefined
+      const normQs = (qs ?? []).map((q) => ({
+        ...q,
+        opts: (q.options ?? []).map((o) => o.label ?? "").filter(Boolean),
+      }))
+      const singleButtonable =
+        normQs.length === 1 && !normQs[0]!.multiple && normQs[0]!.opts.length >= 1 && normQs[0]!.opts.length <= QUESTION_BUTTON_MAX
+      if (singleButtonable) {
+        // 单问题 + 单选 + 选项少：直接按钮（点即答，最快路径）
+        const opts = normQs[0]!.opts
+        if (normQs[0]!.question) lines.push(normQs[0]!.question)
+        const mkBtn = (content: string, type: string, value: { kind: string; requestID: string; label?: string }): FeishuButton => ({
+          tag: "button",
+          text: { tag: "plain_text", content },
+          type,
+          size: "medium",
+          behaviors: [{ type: "callback", value }],
+        })
+        const buttons: FeishuButton[] = opts.map((label, oi) =>
+          mkBtn(label, oi === 0 ? "primary" : "default", { kind: "question", requestID: event.requestID, label }),
+        )
+        // 自定义答案入口：点击后原地变输入表单
+        buttons.push(mkBtn("✍️ 其他答案", "default", { kind: "question_custom", requestID: event.requestID }))
+        actions = buttons
+      } else if (normQs.length > 0) {
+        // 多问题 / 多选：表单（Q 题目与对应选择框交替排列，一次提交回答全部）
+        const formElements: Array<FeishuFormInput | FeishuFormSubmitButton | FeishuSelectStatic | { tag: "markdown"; content: string }> = []
+        for (let qi = 0; qi < normQs.length; qi++) {
+          const q = normQs[qi]!
+          const header = q.question || q.header || `问题 ${qi + 1}`
+          formElements.push({ tag: "markdown", content: `**Q${qi + 1}. ${escapeLarkMd(header)}**${q.multiple === true ? "（可多选）" : ""}` })
+          if (q.opts.length >= 1 && q.opts.length <= QUESTION_SELECT_MAX) {
+            formElements.push({
+              tag: q.multiple === true ? "multi_select_static" : "select_static",
+              name: `q_${qi}`,
+              options: q.opts.map((label) => ({ text: { tag: "plain_text", content: label }, value: label })),
+              placeholder: { tag: "plain_text", content: q.multiple === true ? "可多选" : "请选择" },
             })
-            const buttons: FeishuButton[] = opts.map((label, oi) =>
-              mkBtn(label, oi === 0 ? "primary" : "default", { kind: "question", requestID: event.requestID, label }),
-            )
-            // 自定义答案入口：点击后提示用 /answer 文本回复
-            buttons.push(mkBtn("✍️ 其他答案", "default", { kind: "question_custom", requestID: event.requestID }))
-            actions = buttons
-          } else {
-            lines.push(`选项：${opts.map((o) => `\`${o}\``).join(" / ")}`)
+          } else if (q.opts.length > QUESTION_SELECT_MAX) {
+            formElements.push({
+              tag: "input",
+              name: `q_${qi}`,
+              placeholder: { tag: "plain_text", content: `选项过多，请直接输入：${q.opts.slice(0, 5).join(" / ")}…` },
+            })
           }
         }
+        formElements.push({
+          tag: "button",
+          name: "submit_answers",
+          action_type: "form_submit",
+          text: { tag: "lark_md", content: "提交回答" },
+          type: "primary",
+          value: { kind: "question_form_multi", requestID: event.requestID, count: normQs.length },
+        })
+        extraElement = { tag: "form", name: `answers_form_${event.requestID}`, elements: formElements }
+        lines.push("下拉选择后点**提交回答**，可留空跳过；或回复 **/answer <选项>**")
+      } else {
+        lines.push("(无问题内容)", "", "回复 **/answer <答案>**")
       }
-      lines.push("", "点击按钮回答，或回复 **/answer <选项文本>**")
+      if (!extraElement) lines.push("", "点击按钮回答，或回复 **/answer <选项文本>**")
       return {
         title: "❓ Agent 需要你的回答",
         template: "orange",
         body: lines.join("\n"),
         note: `requestID ${event.requestID}`,
         actions,
+        extraElement,
       }
     }
     case "status":
       return { title: "ℹ️ 状态", template: "turquoise", body: event.text || "(empty)" }
+    case "tui_input":
+      return { title: "👤 TUI 输入", template: "turquoise", body: event.text || "(empty)" }
     default:
       return { title: "ℹ️ 通知", template: "grey", body: "" }
   }
@@ -407,18 +471,19 @@ export function splitContent(body: string, limit = BODY_LIMIT): string[] {
 
 /** 渲染为一张或多张卡片（超长正文分段，标题带 (x/x) 与会话摘要） */
 export function renderCards(event: OutboundEvent): FeishuCard[] {
-  const { title, template, body, note, actions } = cardParts(event)
+  const { title, template, body, note, actions, extraElement } = cardParts(event)
   const chunks = splitContent(body)
   const tag = sessionTag(event)
   return chunks.map((c, i) => {
     const page = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""
-    // 按钮行只放在最后一张分段卡上，保证点击时内容已完整
+    // 按钮行/表单只放在最后一张分段卡上，保证点击时内容已完整
     return makeCard(
       template,
       `${title}${page}${tag}`,
       [{ type: "md", content: c }],
       i === chunks.length - 1 ? note : undefined,
       i === chunks.length - 1 ? actions : undefined,
+      i === chunks.length - 1 ? extraElement : undefined,
     )
   })
 }

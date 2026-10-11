@@ -107,7 +107,7 @@ test("renderer: permission card mentions approve/deny and ordinal", () => {
   assert.ok(text.includes("bash"))
 })
 
-test("renderer: question card renders option buttons (<=6) or text fallback (>6)", () => {
+test("renderer: question card renders option buttons (<=6) or form fallback (>6)", () => {
   const cards = renderCardMulti({
     kind: "question_asked",
     sessionID: "s",
@@ -126,6 +126,7 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
   assert.equal(buttons[2]!.behaviors[0]!.value!.kind, "question_custom")
   assert.ok(JSON.stringify(cards[0]).includes("/answer"))
 
+  // 单问题 >6 选项：不再按钮化，回退为表单内输入框
   const cards2 = renderCardMulti({
     kind: "question_asked",
     sessionID: "s",
@@ -133,9 +134,70 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
     requestID: "q_2",
     questions: [{ question: "Pick", options: Array.from({ length: 8 }, (_, i) => ({ label: `opt${i}` })) }],
   })
-  const text2 = renderOutboundText({ ...cards2, kind: "question_asked", sessionID: "s", chatID: "c", requestID: "q_2", questions: [] } as never)
   const fallback = cards2[0]!.body.elements.find((e) => e.tag === "action")
-  assert.equal(fallback, undefined, ">6 options should fall back to text")
+  assert.equal(fallback, undefined, ">6 options should not render action buttons")
+  const form2 = cards2[0]!.body.elements.find((e) => e.tag === "form") as
+    | { elements: Array<{ tag: string; name?: string }> }
+    | undefined
+  assert.ok(form2, ">6 options should render a form with select dropdown")
+  assert.ok(form2!.elements.some((el) => el.tag === "select_static"), "select dropdown present")
+})
+
+test("renderer: multi-question / multi-select renders form with selects + submit", () => {
+  // 多问题
+  const multi = renderCardMulti({
+    kind: "question_asked",
+    sessionID: "s",
+    chatID: "c",
+    requestID: "q_3",
+    questions: [
+      { question: "Q1?", header: "q1", options: [{ label: "A1" }, { label: "B1" }] },
+      { question: "Q2?", header: "q2", options: [{ label: "A2" }, { label: "B2" }, { label: "C2" }] },
+    ],
+  })
+  const form = multi[0]!.body.elements.find((e) => e.tag === "form") as
+    | {
+        name: string
+        elements: Array<{
+          tag: string
+          name?: string
+          options?: Array<{ value: string }>
+          value?: { kind: string; requestID: string; count?: number }
+          action_type?: string
+        }>
+      }
+    | undefined
+  assert.ok(form, "multi-question renders form")
+  assert.equal(form!.name, "answers_form_q_3")
+  const selects = form!.elements.filter((el) => el.tag === "select_static" || el.tag === "multi_select_static")
+  assert.equal(selects.length, 2, "one select per question")
+  assert.deepEqual(selects.map((s) => s.name), ["q_0", "q_1"])
+  assert.ok(selects.every((s) => s.tag === "select_static"), "single-select by default")
+  const submit = form!.elements.find((el) => el.tag === "button")
+  assert.ok(submit && submit.action_type === "form_submit")
+  assert.deepEqual(submit!.value, { kind: "question_form_multi", requestID: "q_3", count: 2 })
+  assert.ok(JSON.stringify(multi[0]).includes("Q1?") && JSON.stringify(multi[0]).includes("Q2?"), "question labels in body")
+
+  // 单问题但 multiple: true
+  const multiSel = renderCardMulti({
+    kind: "question_asked",
+    sessionID: "s",
+    chatID: "c",
+    requestID: "q_4",
+    questions: [{ question: "Pick many", options: [{ label: "X" }, { label: "Y" }], multiple: true }],
+  })
+  const form4 = multiSel[0]!.body.elements.find((e) => e.tag === "form") as
+    | { elements: Array<{ tag: string }> }
+    | undefined
+  assert.ok(form4, "multi-select question renders form")
+  const sel4 = form4!.elements.find((el) => el.tag === "multi_select_static")
+  assert.ok(sel4, "multi-select uses multi_select_static component")
+})
+
+test("renderer: tui_input renders mirrored input card", () => {
+  const cards = renderCardMulti({ kind: "tui_input", sessionID: "s", chatID: "c", text: "hello from TUI" })
+  assert.equal(cards[0]!.header.title.content.startsWith("👤 TUI 输入"), true)
+  assert.ok(JSON.stringify(cards[0]).includes("hello from TUI"))
 })
 
 test("renderer: no secrets in output", () => {
@@ -188,6 +250,21 @@ test("router: card actions parse permission/question/question_custom/question_fo
     requestID: "q1",
     answers: ["自定义答案"],
   })
+  // 多问题/多选表单：逐题解析，可留空跳过
+  assert.deepEqual(
+    cardActionToCommand({
+      kind: "question_form_multi",
+      requestID: "q2",
+      count: 3,
+      form: { q_0: "A1", q_1: ["B2", "C2"], q_3: "ignored" },
+    }),
+    {
+      action: "question_reply",
+      requestID: "q2",
+      answers: [["A1"], ["B2", "C2"], []],
+    },
+  )
+  assert.equal(cardActionToCommand({ kind: "question_form_multi", requestID: "q2", count: 2 }), null, "missing form rejected")
   assert.equal(cardActionToCommand({ kind: "question_form", requestID: "q1", text: "   " }), null, "blank form text rejected")
   assert.equal(cardActionToCommand({ kind: "diag", foo: 1 }), null)
   assert.equal(cardActionToCommand(null), null)

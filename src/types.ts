@@ -22,12 +22,14 @@ export type OutboundEvent =
       | { kind: "share_close"; sessionID: string; chatID: string; reason: string }
       | { kind: "session_snapshot"; sessionID: string; chatID: string; snapshot: SessionSnapshot }
       | { kind: "task_started"; sessionID: string; chatID: string }
+      | { kind: "task_resumed"; sessionID: string; chatID: string }
       | { kind: "task_retry"; sessionID: string; chatID: string; attempt: number; message: string }
       | { kind: "task_completed"; sessionID: string; chatID: string; summary?: string }
       | { kind: "task_failed"; sessionID: string; chatID: string; error?: string }
       | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; title?: string; ordinal?: number }
       | { kind: "question_asked"; sessionID: string; chatID: string; requestID: string; questions: unknown }
       | { kind: "status"; sessionID: string; chatID: string; text: string }
+      | { kind: "tui_input"; sessionID: string; chatID: string; text: string }
       | { kind: "card_update"; sessionID: string; chatID: string; messageID: string; card: unknown }
     )
     & { sessionTitle?: string })
@@ -47,7 +49,7 @@ export type InboundCommand =
   | { action: "recent" }
   | { action: "abort" }
   | { action: "permission_reply"; requestID: string; reply: "once" | "always" | "reject" }
-  | { action: "question_reply"; requestID: string; answers: string[] }
+  | { action: "question_reply"; requestID: string; answers: string[] | string[][] }
   | { action: "stop" }
   | { action: "help" }
   | { action: "question_custom"; requestID: string }

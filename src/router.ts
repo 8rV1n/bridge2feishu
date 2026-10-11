@@ -88,7 +88,15 @@ export function stripMentionPlaceholders(text: string): string {
 /** 卡片按钮点击 → InboundCommand（value 由渲染时写入，格式受控） */
 export function cardActionToCommand(value: unknown): InboundCommand | null {
   if (!value || typeof value !== "object") return null
-  const v = value as { kind?: string; requestID?: string; reply?: string; label?: string; text?: string }
+  const v = value as {
+    kind?: string
+    requestID?: string
+    reply?: string
+    label?: string
+    text?: string
+    count?: number
+    form?: Record<string, unknown>
+  }
   if (v.kind === "permission" && typeof v.requestID === "string") {
     const reply = v.reply === "always" ? "always" : v.reply === "reject" ? "reject" : "once"
     return { action: "permission_reply", requestID: v.requestID, reply }
@@ -102,6 +110,23 @@ export function cardActionToCommand(value: unknown): InboundCommand | null {
   // 「✍️ 其他答案」表单提交：传输层已把 form_value 的输入文本合并进 value.text
   if (v.kind === "question_form" && typeof v.requestID === "string" && typeof v.text === "string" && v.text.trim()) {
     return { action: "question_reply", requestID: v.requestID, answers: [v.text.trim()] }
+  }
+  // 多问题/多选表单提交：value.form 为 form_value（键 q_0..q_{n-1}，多选为数组）
+  if (v.kind === "question_form_multi" && typeof v.requestID === "string" && v.form && typeof v.form === "object") {
+    const count = Math.max(1, Math.min(Math.floor(Number(v.count)) || 0, 12))
+    const answers: string[][] = []
+    for (let i = 0; i < count; i++) {
+      const raw = v.form[`q_${i}`]
+      if (Array.isArray(raw)) {
+        const sel = raw.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        answers.push(sel)
+      } else if (typeof raw === "string" && raw.trim()) {
+        answers.push([raw.trim()])
+      } else {
+        answers.push([]) // 该题跳过（等同 TUI 的 no answer）
+      }
+    }
+    return { action: "question_reply", requestID: v.requestID, answers }
   }
   return null
 }

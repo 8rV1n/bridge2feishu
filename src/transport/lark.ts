@@ -215,12 +215,15 @@ export class LarkTransport implements FeishuTransport {
             open_chat_id?: string
           }
           const value = e.action?.value
-          // 「✍️ 其他答案」表单提交：把输入框文本合并进 value.text，路由层据此解析为 question_reply
-          const formAnswer = e.action?.form_value?.[CUSTOM_ANSWER_INPUT_NAME]
-          const effValue =
-            typeof formAnswer === "string" && formAnswer.trim() && value && typeof value === "object"
-              ? { ...(value as Record<string, unknown>), text: formAnswer }
-              : value
+          const formValue = e.action?.form_value
+          // 表单提交：把 form_value 合并进 value（custom_answer 单独提升为 text，路由层据此解析）
+          const formAnswer = formValue?.[CUSTOM_ANSWER_INPUT_NAME]
+          let effValue: unknown = value
+          if (typeof formAnswer === "string" && formAnswer.trim() && value && typeof value === "object") {
+            effValue = { ...(value as Record<string, unknown>), text: formAnswer }
+          } else if (formValue && value && typeof value === "object") {
+            effValue = { ...(value as Record<string, unknown>), form: formValue }
+          }
           const cmd = cardActionToCommand(effValue)
           if (!cmd) return {}
           const ctx: InboundContext = {

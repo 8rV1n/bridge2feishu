@@ -1,5 +1,6 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { InboundCommand, InboundContext, OutboundEvent, SessionSnapshot } from "./types.js"
+import { appendFileSync } from "node:fs"
 import { loadConfig, type PluginConfig } from "./config.js"
 import { ShareStateManager } from "./share-state.js"
 import { Security } from "./security.js"
@@ -18,6 +19,15 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const share = new ShareStateManager()
   const security = new Security(config)
   let transport: ReturnType<typeof createTransport> | null = null
+  // 事件流调试日志（FEISHU_SHARE_DEBUG=1 时启用，排查事件时序用）
+  const dbg = ((msg: string): void => {
+    if (process.env.FEISHU_SHARE_DEBUG !== "1") return
+    try {
+      appendFileSync(`${config.stateDir}/plugin-debug.log`, `${new Date().toISOString()} ${msg}\n`)
+    } catch {
+      // 日志失败不影响主流程
+    }
+  })
 
   // ---- 出站通知（busy 去重 + idle 完成后拉取结果；后续阶段做合并/节流） ----
   let busySessions = new Set<string>()
@@ -27,6 +37,10 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const questionOrder: string[] = []
   // 会话忙时的远程 prompt 队列（对齐 TUI 本地排队语义）
   const promptQueue: string[] = []
+  // TUI 本地输入镜像：用户消息 ID 集合 / 已镜像 part / 插件注入 prompt 记录（防回声）
+  const userMessageIDs = new Set<string>()
+  const mirroredParts = new Set<string>()
+  const recentInjected = new Map<string, number>()
   // /model 与 /agent 的列表缓存（保证 list 与 switch 编号一致性）
   let modelCache: Array<{ providerID: string; modelID: string; label: string }> = []
   let agentCache: Array<{ name: string; label: string }> = []
@@ -96,13 +110,82 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   let streaming: Streaming | null = null
   const STREAM_INTERVAL_MS = 1200
   const TIMELINE_MAX = 6
+  // 提问回答后的续段流式：旧卡定格，agent 继续产出时开新卡（保证回复在飞书消息底部可见）
+  let resumeStreaming = false
+  let resumeOpening = false
+  let resumeBuffer: Array<{ id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }> = []
+
+  /** 把一个 message part 应用到流式卡（text→正文 / tool→时间线 / reasoning→思考中） */
+  const applyPartToStreaming = (
+    target: Streaming,
+    p: { id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } },
+  ): void => {
+    if (!target || !p?.id) return
+    if (p.type === "text") {
+      target.textPartIDs.add(p.id)
+      target.parts.set(p.id, p.text ?? "")
+      target.reasoningActive = false
+      scheduleStreamingFlush()
+      return
+    }
+    if (p.type === "tool") {
+      if (p.tool === "question") {
+        // 提问工具：单独的问答卡负责展示，流式卡只显示等待状态，不进时间线
+        // 按工具状态同步等待标志（answered 后不再误显示"等待你的回答"）
+        const st = p.state?.status
+        target.questionPending = !(st === "completed" || st === "error")
+        scheduleStreamingFlush()
+        return
+      }
+      const title = p.state?.title || p.tool || "工具"
+      target.questionPending = false
+      target.tools.set(p.id, { tool: p.tool ?? "tool", title, status: p.state?.status ?? "pending" })
+      scheduleStreamingFlush()
+      return
+    }
+    if (p.type === "reasoning" && target.parts.size === 0) {
+      target.reasoningActive = true
+      scheduleStreamingFlush()
+    }
+  }
+
+  /** 回答后开新流式卡：先落卡，再把等卡期间的 parts 按序回放进去 */
+  const openResumeCard = (sessionID: string): void => {
+    resumeOpening = true
+    dbg(`resume-card opening buffer=${resumeBuffer.length}`)
+    void (async () => {
+      const messageID = await emit({ kind: "task_resumed", sessionID, chatID: share.current?.chatID ?? "mock" })
+      if (!messageID) {
+        dbg("resume-card open FAILED (no messageID)")
+        resumeOpening = false
+        return
+      }
+      dbg(`resume-card opened ${messageID.slice(0, 16)} replay=${resumeBuffer.length}`)
+      const s: Streaming = {
+        messageID,
+        parts: new Map(),
+        textPartIDs: new Set(),
+        reasoningActive: false,
+        questionPending: false,
+        tools: new Map(),
+        lastFlush: 0,
+        timer: null,
+      }
+      for (const part of resumeBuffer) applyPartToStreaming(s, part)
+      resumeBuffer = []
+      streaming = s
+      resumeStreaming = false
+      resumeOpening = false
+      void flushStreaming(false)
+    })()
+  }
 
   const streamingText = (): string => [...(streaming?.parts.values() ?? [])].join("\n").trim()
 
   /** OpenCode 风格活动时间线（最近 N 条：✓ 完成 / ⟳ 运行中 / ✗ 失败 / … 等待） */
-  const streamingTimeline = (): string => {
-    if (!streaming || streaming.tools.size === 0) return ""
-    const entries = [...streaming.tools.values()].slice(-TIMELINE_MAX)
+  const streamingTimeline = (target: Streaming | null = streaming): string => {
+    if (!target || target.tools.size === 0) return ""
+    const entries = [...target.tools.values()].slice(-TIMELINE_MAX)
     return entries
       .map((t) => {
         if (t.status === "completed") return `✓ ${t.title}`
@@ -270,6 +353,12 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   /** 以经典 parts prompt 注入（消息会像本地输入一样出现在 TUI 会话中） */
   const submitPrompt = async (sid: string, text: string): Promise<void> => {
+    // 记录插件注入的 prompt 文本（60s 内用于抑制 TUI 输入镜像的回声）
+    recentInjected.set(text, Date.now())
+    if (recentInjected.size > 64) {
+      const oldest = [...recentInjected.entries()].sort((a, b) => a[1] - b[1])[0]
+      if (oldest) recentInjected.delete(oldest[0])
+    }
     const { model, agent } = await resolveSessionModel(sid)
     const res = await api.client.session.prompt({
       sessionID: sid,
@@ -305,7 +394,23 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     await emit({ kind: "status", sessionID: sharedSession() ?? "", chatID, text: `rejected: ${reason}` })
   }
 
-  const handleInbound = async (cmd: InboundCommand, ctx: InboundContext): Promise<void> => {
+  /** 回答明细文本：Q 保留原问题、A 显示选择（问题原文缺失时只显示 A） */
+  const answerDetail = (answers: string[] | string[][], qInfo: Array<{ question?: string; header?: string }>): string => {
+    const rows = (answers.length > 0 && Array.isArray(answers[0]) ? answers : [answers]) as unknown as string[][]
+    return rows
+      .map((a, i) => {
+        const q = qInfo[i]?.question || qInfo[i]?.header || ""
+        const qLine = q ? `Q${i + 1}. ${q.slice(0, 120)}\n` : ""
+        return `${qLine}A${i + 1}. ${a.length > 0 ? a.join("、") : "（跳过）"}`
+      })
+      .join("\n")
+  }
+
+  const handleInbound = async (
+    cmd: InboundCommand,
+    ctx: InboundContext,
+    opts?: { silentStatus?: boolean },
+  ): Promise<void> => {
     const guard = security.checkInbound(ctx)
     if (!guard.ok) {
       security.audit({ direction: "in", action: cmd.action, ok: false, senderID: ctx.senderID, chatID: ctx.chatID, detail: guard.reason })
@@ -401,12 +506,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         const idx = permissionOrder.indexOf(requestID)
         if (idx >= 0) permissionOrder.splice(idx, 1)
         const res = await api.client.permission.reply({ requestID, reply: cmd.reply })
-        await emit({
-          kind: "status",
-          sessionID: sid,
-          chatID: ctx.chatID,
-          text: res.error !== undefined ? `permission reply failed: ${JSON.stringify(res.error)}` : `permission ${requestID} -> ${cmd.reply}`,
-        })
+        if (!opts?.silentStatus) {
+          await emit({
+            kind: "status",
+            sessionID: sid,
+            chatID: ctx.chatID,
+            text: res.error !== undefined
+              ? `审批失败: ${JSON.stringify(res.error)}`
+              : `已审批：${cmd.reply === "once" ? "批准一次" : cmd.reply === "always" ? "永久批准" : "拒绝"}`,
+          })
+        }
         return
       }
       case "question_reply": {
@@ -424,12 +533,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
             ? (cmd.answers as unknown as string[][])
             : [cmd.answers as unknown as string[]]
         const res = await api.client.question.reply({ requestID, answers })
-        await emit({
-          kind: "status",
-          sessionID: sid,
-          chatID: ctx.chatID,
-          text: res.error !== undefined ? `question reply failed: ${JSON.stringify(res.error)}` : `question ${requestID} answered`,
-        })
+        if (!opts?.silentStatus) {
+          await emit({
+            kind: "status",
+            sessionID: sid,
+            chatID: ctx.chatID,
+            text: res.error !== undefined
+              ? `回答失败: ${JSON.stringify(res.error)}`
+              : `已回答：${answers.map((a) => a.join("、") || "(跳过)").join(" / ")}`,
+          })
+        }
         return
       }
       case "question_custom": {
@@ -547,15 +660,27 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // question_custom 的引导卡由传输层同步返回，无需异步处理
       if (cmd.action === "question_custom") return
       const kind = cmd.action === "permission_reply" ? "权限审批" : "问题回答"
+      // 问题原文缓存（handleInbound 会清 pendingQuestions，需先取）
+      const qInfo =
+        cmd.action === "question_reply"
+          ? ((pendingQuestions.get(cmd.requestID) as { questions?: Array<{ question?: string; header?: string }> } | undefined)?.questions ?? [])
+          : []
+      // 卡片按钮作答：定格旧流式卡（回复将开新卡展示，不再重复回答内容）
+      if (cmd.action === "question_reply") {
+        onQuestionResolved("card-action", cmd.requestID)
+      }
       void (async () => {
-        await handleInbound(cmd, ctx)
+        await handleInbound(cmd, ctx, { silentStatus: true })
         if (messageID && transport && (cmd.action === "permission_reply" || cmd.action === "question_reply")) {
-          const operator = ctx.senderID
           const detail =
             cmd.action === "permission_reply"
-              ? `${cmd.requestID} → ${cmd.reply}`
-              : `${cmd.requestID} → ${cmd.answers.join(", ")}`
-          await transport.updateCard(messageID, renderProcessedCard(kind, detail, operator)).catch(() => {})
+              ? cmd.reply === "once"
+                ? "已批准（一次）"
+                : cmd.reply === "always"
+                  ? "已批准（永久）"
+                  : "已拒绝"
+              : answerDetail(cmd.answers, qInfo)
+          await transport.updateCard(messageID, renderProcessedCard(kind, detail)).catch(() => {})
         }
       })()
     })
@@ -589,10 +714,14 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     const { sessionID, status } = e.properties
     if (!share.isShared(sessionID)) return
     const chatID = share.current?.chatID ?? "mock"
+    dbg(`status ${status.type} session=${sessionID.slice(0, 12)} busy=${busySessions.has(sessionID)} streaming=${streaming ? streaming.messageID.slice(0, 12) : "null"} resume=${resumeStreaming}`)
     if (status.type === "busy") {
       if (busySessions.has(sessionID)) return
       busySessions.add(sessionID)
       closeStreaming()
+      resumeStreaming = false
+      resumeBuffer = []
+      resumeOpening = false
       void (async () => {
         const messageID = await emit({ kind: "task_started", sessionID, chatID })
         if (messageID)
@@ -634,6 +763,9 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (status.type === "idle") {
       if (!busySessions.has(sessionID)) return
       busySessions.delete(sessionID)
+      resumeStreaming = false
+      resumeBuffer = []
+      resumeOpening = false
       if (streaming) {
         // 流式卡定稿（承担 task_completed 通知，避免重复消息）
         void (async () => {
@@ -655,32 +787,72 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // 流式刷新：正文文本流式；工具调用进活动时间线（对齐 TUI）；reasoning 只显示"思考中"
   api.event.on("message.part.updated", (e) => {
     const { sessionID, part } = e.properties
-    if (!streaming || !share.isShared(sessionID)) return
-    const p = part as { id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }
+    const p = part as {
+      id?: string
+      messageID?: string
+      type?: string
+      text?: string
+      synthetic?: boolean
+      ignored?: boolean
+      tool?: string
+      state?: { status?: string; title?: string }
+    }
     if (!p?.id) return
-    if (p.type === "text") {
-      streaming.textPartIDs.add(p.id)
-      streaming.parts.set(p.id, p.text ?? "")
-      streaming.reasoningActive = false
-      scheduleStreamingFlush()
-      return
-    }
-    if (p.type === "tool") {
-      if (p.tool === "question") {
-        // 提问工具：单独的问答卡负责展示，流式卡只显示等待状态，不进时间线
-        streaming.questionPending = true
-        scheduleStreamingFlush()
-        return
+    dbg(`part type=${p.type} tool=${p.tool ?? "-"} st=${p.state?.status ?? "-"} msg=${p.messageID?.slice(0, 12) ?? "-"} userMsg=${p.messageID ? userMessageIDs.has(p.messageID) : "-"} streaming=${streaming ? "y" : "n"} resume=${resumeStreaming} busy=${busySessions.has(sessionID)}`)
+    // 用户消息的文本 part：镜像到飞书（TUI 本地输入同步），不进流式卡正文
+    if (p.messageID && userMessageIDs.has(p.messageID)) {
+      if (
+        p.type === "text" &&
+        !p.synthetic &&
+        !p.ignored &&
+        typeof p.text === "string" &&
+        p.text.trim() &&
+        !mirroredParts.has(p.id)
+      ) {
+        mirroredParts.add(p.id)
+        if (mirroredParts.size > 200) {
+          const first = mirroredParts.values().next().value
+          if (first) mirroredParts.delete(first)
+        }
+        const text = p.text.trim()
+        const injectedAt = recentInjected.get(text)
+        if (injectedAt && Date.now() - injectedAt < 60_000) {
+          recentInjected.delete(text) // 飞书注入的 prompt 回声，跳过
+        } else {
+          void emit({ kind: "tui_input", sessionID, chatID: share.current?.chatID ?? "mock", text: text.slice(0, 1000) })
+        }
       }
-      const title = p.state?.title || p.tool || "工具"
-      streaming.questionPending = false
-      streaming.tools.set(p.id, { tool: p.tool ?? "tool", title, status: p.state?.status ?? "pending" })
-      scheduleStreamingFlush()
       return
     }
-    if (p.type === "reasoning" && streaming.parts.size === 0) {
-      streaming.reasoningActive = true
-      scheduleStreamingFlush()
+    if (!share.isShared(sessionID)) return
+    if (!streaming) {
+      // 提问回答后 agent 继续产出：为后续回复开一张新流式卡（旧卡已定格在上方）
+      if (resumeStreaming && busySessions.has(sessionID) && (p.type === "text" || p.type === "tool" || p.type === "reasoning")) {
+        resumeBuffer.push(p)
+        if (!resumeOpening) openResumeCard(sessionID)
+      }
+      return
+    }
+    // 提问刚被回答：TUI 事件总线不发 question.replied（API 应答不触发），
+    // 以 question 工具 part 状态变 completed/error 为准 → 定格旧卡，后续回复开新卡
+    if (p.type === "tool" && p.tool === "question" && streaming.questionPending && (p.state?.status === "completed" || p.state?.status === "error")) {
+      streaming.questionPending = false
+      onQuestionResolved("tool-part", p.id ?? "-")
+      return
+    }
+    applyPartToStreaming(streaming, p)
+  })
+
+  // TUI 用户消息跟踪：为镜像本地输入识别用户消息（仅共享会话）
+  api.event.on("message.updated", (e) => {
+    const { sessionID, info } = e.properties
+    const m = info as { id?: string; role?: string } | undefined
+    if (!m?.id || m.role !== "user") return
+    if (share.isShared(sessionID)) userMessageIDs.add(m.id)
+    else userMessageIDs.delete(m.id)
+    if (userMessageIDs.size > 200) {
+      const first = userMessageIDs.values().next().value
+      if (first) userMessageIDs.delete(first)
     }
   })
 
@@ -737,12 +909,34 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     pendingQuestions.set(id, e.properties)
     void emit({ kind: "question_asked", sessionID, chatID: share.current?.chatID ?? "", requestID: id, questions })
   })
+  /** 提问已解决（回答/拒绝）：定格旧流式卡，agent 继续产出时开新卡展示回复 */
+  const onQuestionResolved = (source: string, requestID: string): void => {
+    dbg(`question.${source} id=${requestID} streaming=${streaming ? streaming.messageID.slice(0, 12) : "null"} resume -> true`)
+    if (streaming) {
+      streaming.questionPending = false
+      const prev = streaming
+      const segments = [streamingTimeline(prev), "✅ 已收到你的回答，继续处理中…", [...prev.parts.values()].join("\n").trim()]
+      closeStreaming()
+      resumeStreaming = true
+      resumeBuffer = []
+      resumeOpening = false
+      void transport
+        ?.updateCard(prev.messageID, renderStreamingCard("⏳ 已收到回答，继续处理…", segments.filter(Boolean).join("\n\n"), "blue"))
+        .catch(() => {})
+      return
+    }
+    resumeStreaming = true
+    resumeBuffer = []
+    resumeOpening = false
+  }
+
   api.event.on("question.replied", (e) => {
     const requestID = e.properties.requestID
     if (!pendingQuestions.has(requestID)) return
     pendingQuestions.delete(requestID)
     const idx = questionOrder.indexOf(requestID)
     if (idx >= 0) questionOrder.splice(idx, 1)
+    onQuestionResolved("replied", requestID)
   })
   api.event.on("question.rejected", (e) => {
     const requestID = e.properties.requestID
@@ -750,6 +944,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     pendingQuestions.delete(requestID)
     const idx = questionOrder.indexOf(requestID)
     if (idx >= 0) questionOrder.splice(idx, 1)
+    onQuestionResolved("rejected", requestID)
   })
 
   // ---- /feishu 命令与交互菜单 ----
