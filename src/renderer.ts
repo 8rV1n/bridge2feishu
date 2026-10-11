@@ -43,6 +43,69 @@ function escapeLarkMd(text: string): string {
   return text.replace(/\{\{/g, "{ {")
 }
 
+/** 计算显示宽度（CJK 记 2，保证代码块内对齐） */
+function displayWidth(s: string): number {
+  let w = 0
+  for (const ch of s) w += /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF\u3000-\u303F]/.test(ch) ? 2 : 1
+  return w
+}
+
+function padCell(s: string, width: number): string {
+  return s + " ".repeat(Math.max(0, width - displayWidth(s)))
+}
+
+function parseTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((c) => c.trim())
+}
+
+const isTableRow = (line: string): boolean => /^\s*\|.*\|\s*$/.test(line)
+const isTableSeparator = (line: string): boolean => /^\s*\|[\s:|-]+\|\s*$/.test(line)
+
+/**
+ * lark_md 不支持 markdown 表格：把表格块转换为等宽对齐的 code block，
+ * 列宽按显示宽度计算（CJK=2），表头下加分隔线。
+ */
+export function convertMarkdownTables(body: string): string {
+  const lines = body.split("\n")
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]!
+    if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1]!)) {
+      const rows: string[][] = [parseTableRow(line)]
+      i += 2
+      while (i < lines.length && isTableRow(lines[i]!)) {
+        rows.push(parseTableRow(lines[i]!))
+        i++
+      }
+      const colCount = Math.max(...rows.map((r) => r.length))
+      const widths: number[] = Array.from({ length: colCount }, (_, c) =>
+        Math.max(...rows.map((r) => displayWidth(r[c] ?? ""))),
+      )
+      const fmt = (row: string[]): string =>
+        row.map((cell, c) => padCell(cell ?? "", widths[c] ?? 0)).join("  ").trimEnd()
+      const block = [
+        fmt(rows[0] ?? []),
+        rows
+          .slice(1)
+          .map(() => "─".repeat(widths.reduce((a, b) => a + b, 0) + (colCount - 1) * 2))
+          .join("  "),
+        ...rows.slice(1).map((r) => fmt(r)),
+      ]
+      out.push("```text", ...block, "```")
+      continue
+    }
+    out.push(line)
+    i++
+  }
+  return out.join("\n")
+}
+
 /** 按行聚合分段；单行超限做字符硬切；保证每段不超过 limit */
 export function splitContent(body: string, limit = BODY_LIMIT): string[] {
   if (body.length <= limit) return [body]
@@ -66,7 +129,7 @@ export function splitContent(body: string, limit = BODY_LIMIT): string[] {
 }
 
 function card(template: string, title: string, body: string, note?: string): FeishuCard {
-  const elements: FeishuCard["elements"] = [{ tag: "markdown", content: escapeLarkMd(body) }]
+  const elements: FeishuCard["elements"] = [{ tag: "markdown", content: escapeLarkMd(convertMarkdownTables(body)) }]
   if (note) elements.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
   return {
     config: { wide_screen_mode: true },
@@ -230,7 +293,7 @@ export function renderCards(event: OutboundEvent): FeishuCard[] {
   })
 }
 
-/** 流式刷新卡（单张、单卡上限、可选光标） */
+/** 流式刷新卡（单张、单卡上限、可选光标）；表格同样转换 */
 export function renderStreamingCard(title: string, body: string, template: string): FeishuCard {
   return card(template, title, body || "正在处理…")
 }

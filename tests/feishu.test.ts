@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { parseFeishuCommand } from "../dist/router.js"
-import { renderCards as renderCardMulti, renderOutbound as renderOutboundText, HELP_TEXT } from "../dist/renderer.js"
+import { renderCards as renderCardMulti, renderOutbound as renderOutboundText, convertMarkdownTables, HELP_TEXT } from "../dist/renderer.js"
 import { ReplayGuard } from "../dist/transport/lark.js"
 import type { OutboundEvent } from "../dist/types.js"
 
@@ -254,4 +254,48 @@ test("renderer: share_open card keeps sessionID note", () => {
   const cards = renderCardMulti({ kind: "share_open", sessionID: "ses_abc", chatID: "c1", session: { id: "ses_abc", title: "T" } })
   const noteEl = cards[0]!.elements.find((e) => e.tag === "note") as { elements: Array<{ content: string }> } | undefined
   assert.ok(noteEl?.elements[0]!.content.includes("ses_abc"))
+})
+
+// ---------- markdown table conversion ----------
+
+test("renderer: markdown tables convert to aligned code blocks (lark_md has no table support)", () => {
+  const body = [
+    "前置说明",
+    "",
+    "| 模型 | 费用 | 状态 |",
+    "|---|---|---|",
+    "| glm-5-3-flash | $0.0037 | idle |",
+    "| gpt-x | $0.12 | busy |",
+    "",
+    "后置说明",
+  ].join("\n")
+  const out = convertMarkdownTables(body)
+  assert.ok(out.includes("```text"))
+  assert.ok(out.includes("模型"), "header preserved")
+  assert.ok(out.includes("glm-5-3-flash"))
+  assert.ok(out.includes("─"), "header separator line added")
+  assert.ok(!out.includes("|---|"), "separator row removed")
+  // 对齐：同一列的单元格起点一致（用显示宽度验证）
+  const blockLines = out.split("\n").filter((l) => l.includes("glm-5-3-flash") || l.includes("gpt-x"))
+  const g1 = blockLines[0]!.indexOf("$0.0037")
+  const g2 = blockLines[1]!.indexOf("$0.12")
+  assert.equal(g1, g2, "columns aligned")
+  // 非表格行不受影响
+  assert.ok(out.includes("前置说明"))
+  assert.ok(out.includes("后置说明"))
+})
+
+test("renderer: CJK cells are double-width padded", () => {
+  const out = convertMarkdownTables(["| 名称 | 值 |", "|---|---|", "| 长名称单元格 | 1 |", "| 短 | 22 |"].join("\n"))
+  const dataLines = out.split("\n").filter((l) => l.includes("长名称单元格") || l.startsWith("短"))
+  assert.equal(dataLines.length, 2)
+  // 第二列在"显示宽度"上对齐（CJK 记 2）：第二列内容的显示宽度起点一致
+  const prefixWidth = (line: string, marker: string): number => {
+    const idx = line.indexOf(marker)
+    const prefix = line.slice(0, idx)
+    let w = 0
+    for (const ch of prefix) w += /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/.test(ch) ? 2 : 1
+    return w
+  }
+  assert.equal(prefixWidth(dataLines[0]!, "1"), prefixWidth(dataLines[1]!, "22"))
 })
