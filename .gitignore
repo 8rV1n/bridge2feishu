@@ -21,3 +21,4 @@ bridge2feishu-sandbox/
 
 # 编辑器/系统
 .DS_Store
+.feishu-*.mjs
