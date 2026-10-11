@@ -1,0 +1,84 @@
+#!/usr/bin/expect -f
+# E2E 回归驱动：在隔离沙箱启动真实 TUI，用 Mock 飞书通道跑一次完整分享闭环
+# 用法：expect scripts/e2e-driver.exp（需要 opencode 在 PATH；模型凭证按需）
+# 结果看：<sandbox>/feishu-state/outbox.jsonl（share_open → task_started → task_completed → status → share_close）
+set timeout 30
+set sandbox $env(HOME)/OpenCodeHome/bridge2feishu-sandbox
+file mkdir $sandbox
+log_file -noappend $sandbox/e2e.log
+file mkdir $sandbox/.opencode
+set pluginPath [file join [file dirname [info script]] .. dist index.js]
+set pluginPath [file normalize $pluginPath]
+set fh [open $sandbox/.opencode/tui.json w]
+puts $fh [format {{"$schema": "https://opencode.ai/tui.json", "plugin": ["%s"]}} $pluginPath]
+close $fh
+cd $sandbox
+set env(TERM) xterm-256color
+set env(FEISHU_SHARE_STATE_DIR) $sandbox/feishu-state
+set env(FEISHU_ALLOWED_OPEN_IDS) "*"
+set env(FEISHU_ALLOWED_CHAT_IDS) "*"
+set env(FEISHU_DEFAULT_CHAT_ID) "mock-chat"
+spawn opencode
+
+proc drain {{secs 2}} {
+  set until [expr {[clock seconds] + $secs}]
+  while {[clock seconds] < $until} {
+    expect {
+      -timeout 1
+      -re ".+" {}
+      timeout {}
+      eof { return }
+    }
+  }
+}
+
+drain 8
+
+# phase 1: create session
+send "Reply with exactly: READY"
+drain 2
+send "\r"
+drain 40
+
+# phase 2: /feishu menu -> Share current session
+send "/feishu"
+drain 2
+send "\r"
+drain 3
+send "\r"
+drain 4
+send "\x1b"
+drain 2
+
+# phase 3: menu -> down x3 -> PoC test prompt
+send "/feishu"
+drain 2
+send "\r"
+drain 2
+send "\x1b\[B\x1b\[B\x1b\[B"
+drain 1
+send "\r"
+drain 8
+
+# phase 4: inbound commands via mock inbox
+file mkdir $sandbox/feishu-state
+set inbox $sandbox/feishu-state/inbox.jsonl
+set f1 [open $inbox a]
+puts $f1 {{"senderID": "ou_tester", "chatID": "mock-chat", "messageID": "m1", "command": {"action": "status"}}}
+close $f1
+drain 5
+set f2 [open $inbox a]
+puts $f2 {{"senderID": "ou_tester", "chatID": "mock-chat", "messageID": "m2", "command": {"action": "stop"}}}
+close $f2
+drain 5
+
+drain 2
+send "\x1b"
+drain 1
+send "/exit"
+drain 2
+send "\r"
+drain 5
+
+exec kill [exp_pid] 2>/dev/null
+exit 0

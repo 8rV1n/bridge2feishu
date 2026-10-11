@@ -1,0 +1,34 @@
+{
+  "name": "opencode-feishu-share",
+  "version": "0.1.0-poc",
+  "description": "OpenCode native TUI plugin: share the current session to Feishu with bidirectional interaction (WebSocket long connection, no public port).",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --experimental-strip-types tests/*.test.ts",
+    "poc": "node scripts/poc.mjs"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.35",
+    "@opencode-ai/sdk": "1.18.35",
+    "@types/node": "24.12.2",
+    "typescript": "5.8.2"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0",
+    "@opencode-ai/sdk": ">=1.18.0"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.74.0"
+  }
+}

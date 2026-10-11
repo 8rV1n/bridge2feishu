@@ -1,0 +1,28 @@
+#!/usr/bin/expect -f
+set timeout 30
+log_file -noappend /var/folders/2t/4dfw422j6_b89ckxnfrwhxnm0000gn/T/opencode/poc_debug_run4.log
+cd /var/folders/2t/4dfw422j6_b89ckxnfrwhxnm0000gn/T/opencode/poc-project
+set env(TERM) xterm-256color
+spawn opencode
+
+proc drain {{secs 2}} {
+  set until [expr {[clock seconds] + $secs}]
+  while {[clock seconds] < $until} {
+    expect {
+      -timeout 1
+      -re ".+" {}
+      timeout {}
+      eof { return }
+    }
+  }
+}
+
+drain 8
+send "abc"
+drain 3
+send "def"
+drain 2
+send "\r"
+drain 3
+exec kill [exp_pid] 2>/dev/null
+exit 0

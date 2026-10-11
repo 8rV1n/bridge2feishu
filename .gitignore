@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# build output（用 npm run build 重新生成）
+dist/
+
+# 环境变量与密钥（绝不提交）
+.env
+.env.*
+!.env.example
+
+# 日志与临时产物
+*.log
+feishu-state/
+audit.jsonl
+outbox.jsonl
+inbox.jsonl
+
+# E2E 沙箱
+bridge2feishu-sandbox/
+
+# 编辑器/系统
+.DS_Store
