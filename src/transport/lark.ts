@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { FeishuTransport, InboundCommand, InboundContext, OutboundEvent } from "../types.js"
 import { parseFeishuCommand, cardActionToCommand } from "../router.js"
-import { renderCards, renderStreamingCard, type FeishuCard } from "../renderer.js"
+import { renderCards, renderStreamingCard, renderCustomAnswerFormCard, CUSTOM_ANSWER_INPUT_NAME, type FeishuCard } from "../renderer.js"
 
 /**
  * 飞书官方 SDK 传输层（LarkChannel：WebSocket 长连接，无公网端口）。
@@ -195,9 +195,13 @@ export class LarkTransport implements FeishuTransport {
 
     this.channel = channel
 
+    await channel.connect()
+
     // ---- 同步响应卡片回调（飞书要求 3s 内应答，否则显示 callback timeout） ----
-    // SDK 的 cardAction 处理走异步队列、不向飞书返回响应；这里替换 dispatcher 上的
-    // card.action.trigger 处理器：立即同步返回"处理中"卡片，业务逻辑异步执行。
+    // SDK 在 connect() 内部才注册 card.action.trigger 处理器（异步队列、不向飞书返回
+    // 应答卡）。必须在 connect() 之后替换，否则 handles 里没有该键、替换被静默跳过
+    // （实测：替换发生在 connect 前时，同步应答卡从未生效）。
+    // 替换后的处理器：立即同步返回"处理中"卡片，业务逻辑异步执行。
     type DispatcherLike = { handles?: Map<string, (data: unknown) => Promise<unknown>> }
     const dispatcher = (channel as unknown as { dispatcher?: DispatcherLike }).dispatcher
     if (dispatcher?.handles?.has("card.action.trigger")) {
@@ -205,38 +209,49 @@ export class LarkTransport implements FeishuTransport {
         try {
           const e = raw as {
             operator?: { open_id?: string; openId?: string }
-            action?: { value?: unknown }
+            action?: { value?: unknown; form_value?: Record<string, unknown> }
             context?: { open_message_id?: string; open_chat_id?: string }
             open_message_id?: string
             open_chat_id?: string
           }
           const value = e.action?.value
-          const cmd = cardActionToCommand(value)
+          // 「✍️ 其他答案」表单提交：把输入框文本合并进 value.text，路由层据此解析为 question_reply
+          const formAnswer = e.action?.form_value?.[CUSTOM_ANSWER_INPUT_NAME]
+          const effValue =
+            typeof formAnswer === "string" && formAnswer.trim() && value && typeof value === "object"
+              ? { ...(value as Record<string, unknown>), text: formAnswer }
+              : value
+          const cmd = cardActionToCommand(effValue)
           if (!cmd) return {}
           const ctx: InboundContext = {
             senderID: e.operator?.open_id ?? e.operator?.openId ?? "unknown",
             chatID: e.context?.open_chat_id ?? e.open_chat_id ?? "unknown",
             messageID: e.context?.open_message_id ?? e.open_message_id,
           }
+          // 防重放：与 SDK 事件路径同键格式，两条路径不会重复执行同一次点击
+          if (!this.guard.first(`${ctx.messageID}:${ctx.senderID}:${JSON.stringify(effValue ?? {})}`)) return {}
           this.log("info", `card action: ${cmd.action} from ${ctx.senderID}`)
           // 同步应答：立即返回"处理中/引导"卡片（飞书原地替换，无 timeout）
           let respCard: FeishuCard
+          let toast: { type: string; content: string } | undefined = { type: "info", content: "已收到，正在处理…" }
           if (cmd.action === "question_custom") {
-            respCard = renderStreamingCard("✍️ 自定义回答", "请直接回复: /answer <你的答案>（将作为本次提问的回答）", "grey")
+            // 其他答案 → 原地替换为卡片内输入表单（提交后走 question_reply 流程）
+            respCard = renderCustomAnswerFormCard(cmd.requestID)
+            toast = undefined
           } else {
             respCard = renderStreamingCard(cmd.action === "permission_reply" ? "⏳ 正在处理审批…" : "⏳ 正在提交回答…", "操作已收到，正在执行…", "grey")
           }
           // 异步执行业务（回复/置灰由 onCardAction 回调完成）
-          queueMicrotask(() => this.cardActionHandler?.(value, ctx, ctx.messageID))
-          return respCard
+          queueMicrotask(() => this.cardActionHandler?.(effValue, ctx, ctx.messageID))
+          // 同步应答体必须是官方包装结构 {card:{type:"raw",data:卡片JSON}}——
+          // 直接返回裸卡片 JSON 会被飞书按格式错误静默丢弃（200673）
+          return { toast, card: { type: "raw", data: respCard } }
         } catch (err) {
           this.log("error", `card action sync handler error: ${String(err)}`)
           return {}
         }
       })
     }
-
-    await channel.connect()
     this.log("info", "lark ws connected")
   }
 

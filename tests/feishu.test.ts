@@ -1,7 +1,12 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { parseFeishuCommand } from "../dist/router.js"
-import { renderCards as renderCardMulti, renderOutbound as renderOutboundText, HELP_TEXT } from "../dist/renderer.js"
+import { parseFeishuCommand, cardActionToCommand } from "../dist/router.js"
+import {
+  renderCards as renderCardMulti,
+  renderOutbound as renderOutboundText,
+  renderCustomAnswerFormCard,
+  HELP_TEXT,
+} from "../dist/renderer.js"
 import { ReplayGuard } from "../dist/transport/lark.js"
 import type { OutboundEvent } from "../dist/types.js"
 
@@ -111,13 +116,14 @@ test("renderer: question card renders option buttons (<=6) or text fallback (>6)
     questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }],
   })
   const buttons = cards[0]!.body.elements.filter((e) => e.tag === "button") as
-    | Array<{ text: { content: string }; value: { kind: string; requestID: string; label?: string } }>
+    | Array<{ text: { content: string }; behaviors: Array<{ type: string; value?: { kind: string; requestID: string; label?: string } }> }>
   assert.ok(buttons.length === 3, "should have option buttons + ✍️ 其他答案")
   assert.equal(buttons[0]!.text.content, "A")
-  assert.equal(buttons[0]!.value.kind, "question")
-  assert.equal(buttons[0]!.value.requestID, "q_1")
+  assert.equal(buttons[0]!.behaviors[0]!.type, "callback")
+  assert.equal(buttons[0]!.behaviors[0]!.value!.kind, "question")
+  assert.equal(buttons[0]!.behaviors[0]!.value!.requestID, "q_1")
   assert.equal(buttons[2]!.text.content, "✍️ 其他答案")
-  assert.equal(buttons[2]!.value.kind, "question_custom")
+  assert.equal(buttons[2]!.behaviors[0]!.value!.kind, "question_custom")
   assert.ok(JSON.stringify(cards[0]).includes("/answer"))
 
   const cards2 = renderCardMulti({
@@ -142,6 +148,49 @@ test("renderer: no secrets in output", () => {
   assert.ok(!text.toLowerCase().includes("app_secret"))
   assert.ok(!text.toLowerCase().includes("api_key"))
   assert.ok(HELP_TEXT.includes("/status"))
+})
+
+test("renderer: custom answer form card has input + submit (question_form)", () => {
+  const card = renderCustomAnswerFormCard("q_form_1")
+  assert.equal(card.schema, "2.0")
+  const form = card.body.elements.find((e) => e.tag === "form") as
+    | { name: string; elements: Array<{ tag: string; name?: string; required?: boolean; value?: { kind: string; requestID: string }; action_type?: string }> }
+    | undefined
+  assert.ok(form, "form container present")
+  assert.equal(form!.name, "answer_form_q_form_1")
+  const input = form!.elements.find((e) => e.tag === "input")
+  assert.ok(input && input.name === "custom_answer" && input.required === true)
+  const submit = form!.elements.find((e) => e.tag === "button")
+  assert.ok(submit && submit.action_type === "form_submit")
+  assert.deepEqual(submit!.value, { kind: "question_form", requestID: "q_form_1" })
+})
+
+// ---------- cardActionToCommand ----------
+
+test("router: card actions parse permission/question/question_custom/question_form", () => {
+  assert.deepEqual(cardActionToCommand({ kind: "permission", requestID: "r1", reply: "always" }), {
+    action: "permission_reply",
+    requestID: "r1",
+    reply: "always",
+  })
+  assert.deepEqual(cardActionToCommand({ kind: "question", requestID: "q1", label: "选项 A" }), {
+    action: "question_reply",
+    requestID: "q1",
+    answers: ["选项 A"],
+  })
+  assert.deepEqual(cardActionToCommand({ kind: "question_custom", requestID: "q1" }), {
+    action: "question_custom",
+    requestID: "q1",
+  })
+  // 表单提交（传输层已把 form_value 文本合并进 value.text）
+  assert.deepEqual(cardActionToCommand({ kind: "question_form", requestID: "q1", text: "  自定义答案  " }), {
+    action: "question_reply",
+    requestID: "q1",
+    answers: ["自定义答案"],
+  })
+  assert.equal(cardActionToCommand({ kind: "question_form", requestID: "q1", text: "   " }), null, "blank form text rejected")
+  assert.equal(cardActionToCommand({ kind: "diag", foo: 1 }), null)
+  assert.equal(cardActionToCommand(null), null)
 })
 
 // ---------- ReplayGuard ----------

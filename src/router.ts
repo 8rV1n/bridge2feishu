@@ -88,7 +88,7 @@ export function stripMentionPlaceholders(text: string): string {
 /** 卡片按钮点击 → InboundCommand（value 由渲染时写入，格式受控） */
 export function cardActionToCommand(value: unknown): InboundCommand | null {
   if (!value || typeof value !== "object") return null
-  const v = value as { kind?: string; requestID?: string; reply?: string; label?: string }
+  const v = value as { kind?: string; requestID?: string; reply?: string; label?: string; text?: string }
   if (v.kind === "permission" && typeof v.requestID === "string") {
     const reply = v.reply === "always" ? "always" : v.reply === "reject" ? "reject" : "once"
     return { action: "permission_reply", requestID: v.requestID, reply }
@@ -98,6 +98,10 @@ export function cardActionToCommand(value: unknown): InboundCommand | null {
   }
   if (v.kind === "question_custom" && typeof v.requestID === "string") {
     return { action: "question_custom", requestID: v.requestID }
+  }
+  // 「✍️ 其他答案」表单提交：传输层已把 form_value 的输入文本合并进 value.text
+  if (v.kind === "question_form" && typeof v.requestID === "string" && typeof v.text === "string" && v.text.trim()) {
+    return { action: "question_reply", requestID: v.requestID, answers: [v.text.trim()] }
   }
   return null
 }

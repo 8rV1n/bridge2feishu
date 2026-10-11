@@ -2,7 +2,7 @@ import type { OutboundEvent, SessionSnapshot } from "./types.js"
 
 /**
  * 通知渲染：OutboundEvent → 飞书卡片（JSON 2.0，可能多张）。
- * - 原生 markdown / table 组件（表格真渲染）/ action 按钮（behaviors: callback）
+ * - 原生 markdown / table 组件（表格真渲染）/ action 按钮（behaviors: callback + 内嵌 value）
  * - 超长内容自动分段为多张卡片，标题带 (x/x)；卡片标题尾部附加会话摘要
  * - 超大表格（>40 行）回退为对齐代码块
  * - 状态类通知不调用任何 LLM；默认不上传敏感内容（截断、不含环境变量/文件内容）
@@ -13,8 +13,11 @@ export type FeishuButton = {
   text: { tag: "plain_text"; content: string }
   type?: string
   size?: string
-  behaviors: Array<{ type: "callback" }>
-  value: unknown
+  /**
+   * JSON 2.0 官方写法：回调数据 value 必须内嵌在 behaviors 的 callback 声明里。
+   * 顶层 value 是历史属性——一旦声明 behaviors，顶层 value 不再生效（点击无回调，实测确认）。
+   */
+  behaviors: Array<{ type: "callback"; value?: unknown }>
 }
 
 export type FeishuCardElement =
@@ -22,12 +25,39 @@ export type FeishuCardElement =
   | { tag: "hr" }
   | FeishuButton
   | {
+      /** 表单容器（JSON 2.0）：只能置于卡片根级 body.elements */
+      tag: "form"
+      name: string
+      elements: Array<FeishuFormInput | FeishuFormSubmitButton>
+    }
+  | {
       tag: "table"
       page_size: number
       row_height: string
       columns: Array<{ name: string; display_name: string; data_type: string }>
       rows: Array<Record<string, string>>
     }
+
+/** 表单内输入框组件 */
+export type FeishuFormInput = {
+  tag: "input"
+  /** 表单内唯一标识；提交回调的 form_value 以此为键 */
+  name: string
+  required?: boolean
+  placeholder?: { tag: "plain_text"; content: string }
+  max_length?: number
+}
+
+/** 表单内提交按钮（action_type: form_submit，无 behaviors） */
+export type FeishuFormSubmitButton = {
+  tag: "button"
+  name: string
+  action_type: "form_submit"
+  text: { tag: "lark_md"; content: string }
+  type?: string
+  /** 随表单提交回调带回，用于识别业务 */
+  value?: unknown
+}
 
 export type FeishuCard = {
   schema: "2.0"
@@ -192,6 +222,47 @@ export function renderProcessedCard(kind: string, detail: string, operator: stri
   return makeCard("grey", `✅ 已处理 · ${kind}`, [{ type: "md", content: `${detail}\n\n处理人：${operator}` }])
 }
 
+/**
+ * 「✍️ 其他答案」表单卡：点击其他答案按钮后，由卡片回调同步应答原地替换显示。
+ * 用户在卡片输入框里填写回答并提交，form_value 随 card.action.trigger 回调带回，
+ * 等效于发送 /answer <回答>（飞书不允许机器人预填用户聊天输入框，此为官方等效交互）。
+ */
+export const CUSTOM_ANSWER_INPUT_NAME = "custom_answer"
+
+export function renderCustomAnswerFormCard(requestID: string): FeishuCard {
+  return {
+    schema: "2.0",
+    config: { update_multi: true },
+    header: { title: { tag: "plain_text", content: "✍️ 自定义回答" }, template: "grey" },
+    body: {
+      elements: [
+        { tag: "markdown", content: "请输入你的回答并点击**提交回答**（等同发送 `/answer <回答>`）" },
+        {
+          tag: "form",
+          name: `answer_form_${requestID}`,
+          elements: [
+            {
+              tag: "input",
+              name: CUSTOM_ANSWER_INPUT_NAME,
+              required: true,
+              placeholder: { tag: "plain_text", content: "请输入你的回答" },
+              max_length: 1000,
+            },
+            {
+              tag: "button",
+              name: "submit_answer",
+              action_type: "form_submit",
+              text: { tag: "lark_md", content: "提交回答" },
+              type: "primary",
+              value: { kind: "question_form", requestID },
+            },
+          ],
+        },
+      ],
+    },
+  }
+}
+
 /** 权限审批按钮（JSON 2.0：button 直接作为 body 元素，不再使用 action 容器） */
 function permissionButtons(requestID: string): FeishuCardElement[] {
   const btn = (content: string, type: string, reply: string): FeishuButton => ({
@@ -199,8 +270,7 @@ function permissionButtons(requestID: string): FeishuCardElement[] {
     text: { tag: "plain_text", content },
     type,
     size: "medium",
-    behaviors: [{ type: "callback" }],
-    value: { kind: "permission", requestID, reply },
+    behaviors: [{ type: "callback", value: { kind: "permission", requestID, reply } }],
   })
   return [btn("批准一次", "primary", "once"), btn("永久批准", "default", "always"), btn("拒绝", "danger", "reject")]
 }
@@ -284,8 +354,7 @@ function cardParts(event: OutboundEvent): {
               text: { tag: "plain_text", content },
               type,
               size: "medium",
-              behaviors: [{ type: "callback" }],
-              value,
+              behaviors: [{ type: "callback", value }],
             })
             const buttons: FeishuButton[] = opts.map((label, oi) =>
               mkBtn(label, oi === 0 ? "primary" : "default", { kind: "question", requestID: event.requestID, label }),
