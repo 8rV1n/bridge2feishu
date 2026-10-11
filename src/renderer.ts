@@ -20,7 +20,6 @@ export type FeishuButton = {
 export type FeishuCardElement =
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
-  | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
   | FeishuButton
   | {
       tag: "table"
@@ -179,7 +178,7 @@ function makeCard(
     s.type === "md" ? segmentListToElements(splitTableSegments(s.content)) : segmentToElements(s),
   )
   if (actions) elements.push(...actions)
-  if (note) elements.push({ tag: "hr" }, { tag: "note", elements: [{ tag: "plain_text", content: note }] })
+  if (note) elements.push({ tag: "hr" }, { tag: "markdown", content: escapeLarkMd(note) })
   return {
     schema: "2.0",
     config: { update_multi: true },
@@ -362,7 +361,6 @@ export function renderOutbound(event: OutboundEvent): string {
       const body = c.body.elements
         .map((e) => {
           if (e.tag === "markdown") return e.content
-          if (e.tag === "note") return e.elements.map((x) => x.content).join("")
           if (e.tag === "table") return e.columns.map((col) => col.display_name).join(" | ")
           return ""
         })

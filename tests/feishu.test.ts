@@ -248,10 +248,10 @@ test("renderer: short events keep single card without (x/x) but with session tag
   assert.ok(cards[0]!.header.title.content.includes("My Session"))
 })
 
-test("renderer: share_open card keeps sessionID note", () => {
+test("renderer: share_open card keeps sessionID (as markdown tail, note tag unsupported in V2)", () => {
   const cards = renderCardMulti({ kind: "share_open", sessionID: "ses_abc", chatID: "c1", session: { id: "ses_abc", title: "T" } })
-  const noteEl = cards[0]!.body.elements.find((e) => e.tag === "note") as { elements: Array<{ content: string }> } | undefined
-  assert.ok(noteEl?.elements[0]!.content.includes("ses_abc"))
+  assert.ok(JSON.stringify(cards[0]!.body).includes("ses_abc"))
+  assert.ok(cards[0]!.body.elements.every((e) => e.tag !== "note"), "note tag must not be used in V2 cards")
 })
 
 // ---------- markdown table conversion ----------
