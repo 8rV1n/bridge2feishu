@@ -77,6 +77,8 @@ export class ReplayGuard {
 type LarkModules = {
   createLarkChannel: (opts: Record<string, unknown>) => LarkChannelLike
   Domain: Record<string, string>
+  /** SDK 日志级别是数字枚举（debug=4），传字符串会导致所有日志被静默过滤 */
+  LoggerLevel: Record<string, number>
 }
 
 type LarkChannelLike = {
@@ -134,13 +136,14 @@ export class LarkTransport implements FeishuTransport {
 
     const domain = this.opts.domain ?? mod.Domain?.Feishu ?? "https://open.feishu.cn"
     const sdkLogger = this.opts.debug ? createFileLogger(this.opts.debug.logFile) : undefined
+    const level = mod.LoggerLevel?.debug ?? 4
     const channel = mod.createLarkChannel({
       appId: this.opts.appId,
       appSecret: this.opts.appSecret,
       transport: "websocket",
       domain,
       logger: sdkLogger,
-      loggerLevel: this.opts.debug ? "debug" : "warn",
+      loggerLevel: this.opts.debug ? level : (mod.LoggerLevel?.warn ?? 2),
       source: "opencode-feishu-share",
       policy: { dmMode: "open" },
     })
