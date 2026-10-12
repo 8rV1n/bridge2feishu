@@ -26,7 +26,7 @@ export type OutboundEvent =
       | { kind: "task_retry"; sessionID: string; chatID: string; attempt: number; message: string }
       | { kind: "task_completed"; sessionID: string; chatID: string; summary?: string }
       | { kind: "task_failed"; sessionID: string; chatID: string; error?: string }
-      | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; title?: string; ordinal?: number }
+      | { kind: "permission_requested"; sessionID: string; chatID: string; requestID: string; permission: string; patterns?: string[]; detail?: string; title?: string; ordinal?: number }
       | { kind: "question_asked"; sessionID: string; chatID: string; requestID: string; questions: unknown }
       | { kind: "status"; sessionID: string; chatID: string; text: string }
       | { kind: "tui_input"; sessionID: string; chatID: string; text: string }
@@ -64,6 +64,8 @@ export type FeishuTransport = {
   stop(): Promise<void>
   /** 发送事件；lark 返回 message_id（供流式卡片更新），mock 返回生成的本地 id */
   send(event: OutboundEvent): Promise<string | undefined>
+  /** 直接发送一张已渲染卡片（流式卡超长定稿时的续页），返回新 message_id */
+  sendCard(card: unknown): Promise<string | undefined>
   /** 原地更新一张已发送卡片的内容（流式刷新/按钮点击后置灰） */
   updateCard(messageID: string, card: unknown): Promise<void>
   onInbound(handler: (cmd: InboundCommand, ctx: InboundContext) => void): void

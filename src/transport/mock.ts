@@ -52,6 +52,12 @@ export class MockTransport {
     return messageID
   }
 
+  async sendCard(card: unknown): Promise<string | undefined> {
+    const messageID = `mock_msg_${this.nextID++}`
+    appendFileSync(this.outboxPath, JSON.stringify({ ts: Date.now(), messageID, kind: "card_send", card }) + "\n")
+    return messageID
+  }
+
   async updateCard(messageID: string, card: unknown): Promise<void> {
     appendFileSync(this.outboxPath, JSON.stringify({ ts: Date.now(), kind: "card_update", messageID, card }) + "\n")
   }

@@ -78,7 +78,9 @@ export type FeishuCard = {
 }
 
 /** 单张卡片 markdown 正文上限（字符） */
-const BODY_LIMIT = 1600
+export const BODY_LIMIT = 1600
+/** 单张卡片 markdown 正文上限（UTF-8 字节）：飞书按字节截断超长内容（实测纯中文 ~1K+ 字后截为 "…"） */
+export const BODY_BYTE_LIMIT = 3000
 /** 卡片标题中会话摘要的最大长度 */
 const SESSION_TAG_MAX = 28
 /** 超过该行数的表格回退为代码块 */
@@ -348,7 +350,9 @@ function cardParts(event: OutboundEvent): {
         template: "orange",
         body: [
           `**权限**：${event.permission}`,
+          event.patterns?.length ? `**路径**：${event.patterns.map((p) => `\`${p}\``).join("  ")}` : null,
           event.title ? `**内容**：${event.title}` : null,
+          event.detail ? codeBlock(event.detail) : null,
           "",
           `也可回复 **/approve**（一次）/ **/approve always** / **/deny**`,
         ]
@@ -447,9 +451,38 @@ function cardParts(event: OutboundEvent): {
   }
 }
 
-/** 按行聚合分段；单行超限做字符硬切；保证每段不超过 limit */
+/** 按码点切字符串，保证每段 UTF-8 字节数不超过 maxBytes（不切断多字节字符） */
+function sliceByBytes(s: string, maxBytes: number): string[] {
+  if (maxBytes <= 0) return [s]
+  const parts: string[] = []
+  let cur = ""
+  let curBytes = 0
+  for (const ch of s) {
+    const b = Buffer.byteLength(ch, "utf8")
+    if (curBytes + b > maxBytes && cur) {
+      parts.push(cur)
+      cur = ""
+      curBytes = 0
+    }
+    cur += ch
+    curBytes += b
+  }
+  if (cur) parts.push(cur)
+  return parts.length > 0 ? parts : [s]
+}
+
+/** 先按字符上限切，再对超字节的段按字节细分 */
+function sliceHard(text: string, limit: number, byteLimit: number): string[] {
+  const out: string[] = []
+  for (let i = 0; i < text.length; i += limit) {
+    out.push(...sliceByBytes(text.slice(i, i + limit), byteLimit))
+  }
+  return out.length > 0 ? out : [text]
+}
+
+/** 按行聚合分段；单行超限做字符硬切；保证每段不超过字符与字节上限 */
 export function splitContent(body: string, limit = BODY_LIMIT): string[] {
-  if (body.length <= limit) return [body]
+  if (body.length <= limit && Buffer.byteLength(body, "utf8") <= BODY_BYTE_LIMIT) return [body]
   const chunks: string[] = []
   let cur = ""
   const push = () => {
@@ -457,16 +490,25 @@ export function splitContent(body: string, limit = BODY_LIMIT): string[] {
     cur = ""
   }
   for (const line of body.split("\n")) {
-    if (line.length > limit) {
+    if (line.length > limit || Buffer.byteLength(line, "utf8") > BODY_BYTE_LIMIT) {
       push()
-      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit))
+      chunks.push(...sliceHard(line, limit, BODY_BYTE_LIMIT))
       continue
     }
-    if (cur.length + line.length + 1 > limit) push()
+    const nextLen = cur.length + line.length + 1
+    const nextBytes = Buffer.byteLength(cur, "utf8") + Buffer.byteLength(line, "utf8") + 1
+    if (nextLen > limit || nextBytes > BODY_BYTE_LIMIT) push()
     cur = cur ? `${cur}\n${line}` : line
   }
   push()
   return chunks.length > 0 ? chunks : [body.slice(0, limit)]
+}
+
+/** 流式卡中间刷新用：超长时保留尾部、以省略号标记前文略（整卡不超上限） */
+export function cardTail(text: string): string {
+  if (text.length <= BODY_LIMIT && Buffer.byteLength(text, "utf8") <= BODY_BYTE_LIMIT) return text
+  const tail = sliceByBytes(text, BODY_BYTE_LIMIT - 4).at(-1) ?? text
+  return `…\n${tail}`
 }
 
 /** 渲染为一张或多张卡片（超长正文分段，标题带 (x/x) 与会话摘要） */

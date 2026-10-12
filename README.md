@@ -91,8 +91,9 @@ scripts/            E2E expect 驱动脚本
 ## 测试
 
 ```bash
-npm test        # 66 个自动化测试（单元 + fake-api 集成）
+npm test        # 73 个自动化测试（单元 + fake-api 集成）
 npm run typecheck
 ```
 
 真实飞书联调步骤见 `docs/05-feishu-app-setup.md`；无凭证环境下的全部行为由 Mock 覆盖。
+改动本仓库代码前请先阅读 `AGENTS.md`（架构速览 + 历史 bug 教训清单）。

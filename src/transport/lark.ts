@@ -280,6 +280,12 @@ export class LarkTransport implements FeishuTransport {
     return lastMessageID
   }
 
+  async sendCard(card: unknown): Promise<string | undefined> {
+    if (!this.channel) throw new Error("lark transport not started")
+    const result = await this.channel.send(this.opts.chatID, { card })
+    return result.messageId
+  }
+
   async updateCard(messageID: string, card: object): Promise<void> {
     if (!this.channel) throw new Error("lark transport not started")
     await this.channel.updateCard(messageID, card)

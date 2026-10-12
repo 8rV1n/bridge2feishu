@@ -7,7 +7,7 @@ import { Security } from "./security.js"
 import { lastAssistantText, summarize, textOfMessage } from "./session.js"
 import { MockTransport } from "./transport/mock.js"
 import { createTransport } from "./transport/index.js"
-import { renderOutbound, renderStreamingCard, renderProcessedCard, HELP_TEXT } from "./renderer.js"
+import { renderOutbound, renderStreamingCard, renderProcessedCard, splitContent, cardTail, HELP_TEXT } from "./renderer.js"
 import { cardActionToCommand } from "./router.js"
 
 const TEST_PROMPT = "Reply with exactly: PONG"
@@ -44,6 +44,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   // /model 与 /agent 的列表缓存（保证 list 与 switch 编号一致性）
   let modelCache: Array<{ providerID: string; modelID: string; label: string }> = []
   let agentCache: Array<{ name: string; label: string }> = []
+  // 远程切换 agent/model 的回声抑制窗口：插件自己调用 switch API 后短暂屏蔽事件同步，避免飞书重复通知
+  let remoteSwitchUntil = 0
 
   const listModels = (): Array<{ providerID: string; modelID: string; label: string }> => {
     if (modelCache.length > 0) return modelCache
@@ -60,15 +62,20 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const listAgents = async (): Promise<Array<{ name: string; label: string }>> => {
     if (agentCache.length > 0) return agentCache
     const res = await api.client.v2.agent.list()
-    const agents = (res.error === undefined ? (res.data ?? []) : []) as Array<{
-      name: string
+    // 注意两点（实测确认）：
+    // 1. res.data 是 { location, data: AgentV2Info[] } 包装对象，不是数组——直接 .filter 会抛 TypeError
+    //    被 void handleInbound() 静默吞掉，表现为 /agent 完全没反应
+    // 2. AgentV2Info 字段是 id（不是 name），取错字段列表全变 undefined
+    const payload = res.error === undefined ? res.data : undefined
+    const agents = (Array.isArray(payload) ? payload : (payload?.data ?? [])) as Array<{
+      id: string
       description?: string
       mode?: string
       hidden?: boolean
     }>
     agentCache = agents
       .filter((a) => !a.hidden && a.mode !== "subagent")
-      .map((a) => ({ name: a.name, label: a.description ? `${a.name}（${a.description}）` : a.name }))
+      .map((a) => ({ name: a.id, label: a.description ? `${a.id}（${a.description}）` : a.id }))
     return agentCache
   }
 
@@ -209,19 +216,30 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (timeline) segments.push(timeline)
     if (streaming.questionPending) segments.push("❓ 等待你的回答…")
     if (promptQueue.length > 0) segments.push(`📥 排队 prompt：${promptQueue.length} 条`)
-    if (text) segments.push(final ? text : `${text} ▌`)
+    if (text) segments.push(final ? text : `${cardTail(`${text} ▌`)} ▌`)
     if (segments.length === 0) {
       segments.push(final ? "（无文本输出）" : streaming.reasoningActive ? "🤔 思考中…" : "正在处理…")
     } else if (!final && text && streaming.reasoningActive) {
       segments.push("🤔 思考中…")
     }
     const body = errText ?? segments.join("\n\n")
-    const card =
-      final && errText
-        ? renderStreamingCard("❌ 执行失败", errText, "red")
-        : renderStreamingCard(final ? "✅ 任务完成" : "⏳ 正在处理", body, final ? "green" : "blue")
     try {
-      await transport.updateCard(streaming.messageID, card)
+      if (errText) {
+        await transport.updateCard(streaming.messageID, renderStreamingCard("❌ 执行失败", cardTail(body), "red"))
+        return
+      }
+      if (!final) {
+        await transport.updateCard(streaming.messageID, renderStreamingCard("⏳ 正在处理", body, "blue"))
+        return
+      }
+      // 成功定格：超长正文分页为多张卡（首卡原地更新，续页新增卡片），避免飞书单卡截断
+      const chunks = splitContent(body)
+      const total = chunks.length
+      for (let i = 0; i < total; i++) {
+        const card = renderStreamingCard(`✅ 任务完成${total > 1 ? ` (${i + 1}/${total})` : ""}`, chunks[i]!, "green")
+        if (i === 0) await transport.updateCard(streaming.messageID, card)
+        else await transport.sendCard(card)
+      }
     } catch {
       // 卡片更新失败不影响本地任务
     }
@@ -326,29 +344,62 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   }
 
   /**
-   * 读取会话最后一条 assistant 消息携带的模型/agent，
-   * 远程 prompt 显式沿用（与 TUI 本地提交行为一致，避免 server 默认模型配置失效导致 401）。
+   * 解析远程 prompt 应沿用的模型/agent。优先级：
+   * 1) 服务端会话状态（v2 session.get，权威——实时反映 switchAgent/switchModel，
+   *    已实测远程/TUI 切换后该字段立即更新；TUI 本地状态对外部切换可能滞后，不可作唯一依据）
+   * 2) TUI 本地状态（server 查询失败时兜底）
+   * 3) 最后一条 assistant 消息（最终兜底）
+   * 不能只读最后一条消息——那会把刚切换的 agent/model 又钉回旧值，导致切换"无效"。
    */
   const resolveSessionModel = async (
     sessionID: string,
   ): Promise<{ model?: { providerID: string; modelID: string }; agent?: string }> => {
+    let model: { providerID: string; modelID: string } | undefined
+    let agent: string | undefined
+
+    // 1) 服务端会话状态
     try {
-      const msgs = await fetchMessages(sessionID, 10)
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const info = msgs[i]?.info as
-          | { role?: string; modelID?: string; providerID?: string; agent?: string }
-          | undefined
-        if (info?.role !== "assistant") continue
-        if (!info.modelID || !info.providerID) continue
-        return {
-          model: { providerID: info.providerID, modelID: info.modelID },
-          ...(typeof info.agent === "string" && info.agent ? { agent: info.agent } : {}),
-        }
+      const res = await api.client.v2.session.get({ sessionID })
+      if (res.error === undefined) {
+        // 与 agent.list 同款包装：data 可能是 { data: SessionV2Info }
+        const s = ((res.data as { data?: { agent?: string; model?: { providerID?: string; id?: string } } })?.data ??
+          res.data) as { agent?: string; model?: { providerID?: string; id?: string } } | undefined
+        if (s?.model?.providerID && s.model.id) model = { providerID: s.model.providerID, modelID: s.model.id }
+        if (typeof s?.agent === "string" && s.agent) agent = s.agent
       }
     } catch {
-      // 读取失败则不带 model（回落 server 默认）
+      // 查询失败走下方兜底
     }
-    return {}
+
+    // 2) TUI 本地状态
+    if (!model || !agent) {
+      const s = api.state.session.get(sessionID) as
+        | { agent?: string; model?: { providerID?: string; id?: string } }
+        | undefined
+      if (!model && s?.model?.providerID && s.model.id) model = { providerID: s.model.providerID, modelID: s.model.id }
+      if (!agent && typeof s?.agent === "string" && s.agent) agent = s.agent
+    }
+
+    // 3) 最后一条 assistant 消息
+    if (!model || !agent) {
+      try {
+        const msgs = await fetchMessages(sessionID, 10)
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const info = msgs[i]?.info as
+            | { role?: string; modelID?: string; providerID?: string; agent?: string }
+            | undefined
+          if (info?.role !== "assistant") continue
+          if (!model && info.modelID && info.providerID) {
+            model = { providerID: info.providerID, modelID: info.modelID }
+          }
+          if (!agent && typeof info.agent === "string" && info.agent) agent = info.agent
+          break
+        }
+      } catch {
+        // 读取失败则不带 model（回落 server 默认）
+      }
+    }
+    return { ...(model ? { model } : {}), ...(agent ? { agent } : {}) }
   }
 
   /** 以经典 parts prompt 注入（消息会像本地输入一样出现在 TUI 会话中） */
@@ -433,6 +484,23 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     security.audit({ direction: "in", action: cmd.action, ok: true, senderID: ctx.senderID, chatID: ctx.chatID })
     const sid = sessionID ?? ""
 
+    // 兜底：命令处理抛出的任何异常都回一张错误卡 + 写调试日志，绝不静默失败
+    //（此前 void handleInbound() 会吞掉 unhandled rejection，飞书侧表现为"没反应"）
+    try {
+      await runInbound(cmd, ctx, sid, opts)
+    } catch (err) {
+      dbg(`inbound ${cmd.action} ERROR: ${String(err)}`)
+      await emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `${cmd.action}: ${String(err)}` })
+    }
+  }
+
+  /** 入站命令分发（前置校验通过后的 switch 部分） */
+  const runInbound = async (
+    cmd: InboundCommand,
+    ctx: InboundContext,
+    sid: string,
+    opts?: { silentStatus?: boolean },
+  ): Promise<void> => {
     switch (cmd.action) {
       case "prompt": {
         const text = (cmd.text ?? "").trim()
@@ -574,6 +642,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
           await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `rejected: 模型序号 ${cmd.index} 不存在（先发 /model 查看列表）` })
           return
         }
+        remoteSwitchUntil = Date.now() + 5000
         const res = await api.client.v2.session.switchModel({
           sessionID: sid,
           model: { id: target.modelID, providerID: target.providerID },
@@ -600,6 +669,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
           await emit({ kind: "status", sessionID: sid, chatID: ctx.chatID, text: `rejected: Agent 序号 ${cmd.index} 不存在（先发 /agent 查看列表）` })
           return
         }
+        remoteSwitchUntil = Date.now() + 5000
         const res = await api.client.v2.session.switchAgent({ sessionID: sid, agent: target.name })
         await emit({
           kind: "status",
@@ -698,6 +768,15 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     questionOrder.length = 0
     promptQueue.length = 0
     closeStreaming()
+    // TUI 会话内留一条持久通知（像普通对话消息一样显示、不消失；noReply 不触发 agent 回复）
+    if (was && reason !== "tui exit") {
+      const reasonText = reason === "remote stop" ? "远程 /disconnect" : reason === "menu" ? "TUI 菜单停止" : reason
+      const text = `⏸️ 飞书分享已断开（${reasonText}），本地任务不受影响`
+      recentInjected.set(text, Date.now())
+      void api.client.session
+        .prompt({ sessionID: was.sessionID, parts: [{ type: "text", text }], noReply: true })
+        .catch(() => {})
+    }
     const t = transport
     transport = null
     if (t) {
@@ -706,7 +785,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         .then(() => t.stop())
         .catch(() => {})
     }
-    api.ui.toast({ variant: "info", title: "feishu-share", message: `Sharing stopped (${reason})` })
+    api.ui.toast({ variant: "warning", title: "feishu-share", message: `Sharing stopped (${reason})` })
   }
 
   // ---- 事件监听（TUI → 飞书 通知） ----
@@ -743,9 +822,9 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       const attempt = (status as { attempt?: number }).attempt ?? 0
       const message = String((status as { message?: string }).message ?? "rate limited")
       if (streaming && transport) {
-        void (async () => {
-          if (!streaming || !transport) return
-          const body = `${streamingText()}\n\n⚠️ ${message}（第 ${attempt} 次重试）`
+      void (async () => {
+        if (!streaming || !transport) return
+        const body = `${cardTail(streamingText())}\n\n⚠️ ${message}（第 ${attempt} 次重试）`
           try {
             await transport.updateCard(streaming.messageID, renderStreamingCard("⏳ 模型限流，自动重试中", body, "orange"))
             streaming.lastFlush = Date.now()
@@ -878,18 +957,37 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     })
   })
 
+  /** 权限卡详情：metadata 去掉 title 后的紧凑 JSON（外部目录路径等关键字段通常在 metadata/patterns 里） */
+  const permissionDetail = (metadata: unknown): string | undefined => {
+    if (!metadata || typeof metadata !== "object") return undefined
+    const rest = Object.fromEntries(
+      Object.entries(metadata as Record<string, unknown>).filter(
+        ([k, v]) => k !== "title" && v !== undefined && v !== null && v !== "",
+      ),
+    )
+    if (Object.keys(rest).length === 0) return undefined
+    try {
+      return JSON.stringify(rest, null, 2).slice(0, 600)
+    } catch {
+      return undefined
+    }
+  }
+
   api.event.on("permission.asked", (e) => {
-    const { id, sessionID, permission, metadata } = e.properties
+    const { id, sessionID, permission, patterns, metadata } = e.properties
     if (!share.isShared(sessionID)) return
     if (!pendingPermissions.has(id)) permissionOrder.push(id)
     pendingPermissions.set(id, e.properties)
-    const title = metadata && typeof metadata === "object" ? String((metadata as Record<string, unknown>).title ?? "") : undefined
+    const meta = metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : undefined
+    const title = meta ? String(meta.title ?? "") : undefined
     void emit({
       kind: "permission_requested",
       sessionID,
       chatID: share.current?.chatID ?? "",
       requestID: id,
       permission,
+      patterns: Array.isArray(patterns) ? patterns.map(String) : undefined,
+      detail: permissionDetail(metadata),
       title: title || undefined,
       ordinal: permissionOrder.indexOf(id) + 1,
     })
@@ -900,6 +998,30 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     pendingPermissions.delete(requestID)
     const idx = permissionOrder.indexOf(requestID)
     if (idx >= 0) permissionOrder.splice(idx, 1)
+  })
+
+  // TUI 本地切换 Agent/模型 → 同步通知飞书（远程切换由指令路径负责通知，5s 窗口内抑制回声）
+  api.event.on("session.next.agent.switched", (e) => {
+    const { sessionID, agent } = e.properties
+    if (!share.isShared(sessionID)) return
+    if (Date.now() < remoteSwitchUntil) return
+    void emit({
+      kind: "status",
+      sessionID,
+      chatID: share.current?.chatID ?? "mock",
+      text: `🔀 已切换 Agent → **${agent}**（对后续对话生效）`,
+    })
+  })
+  api.event.on("session.next.model.switched", (e) => {
+    const { sessionID, model } = e.properties
+    if (!share.isShared(sessionID)) return
+    if (Date.now() < remoteSwitchUntil) return
+    void emit({
+      kind: "status",
+      sessionID,
+      chatID: share.current?.chatID ?? "mock",
+      text: `🔀 已切换模型 → **${model.providerID}/${model.id}**（对后续对话生效）`,
+    })
   })
 
   api.event.on("question.asked", (e) => {
@@ -915,7 +1037,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (streaming) {
       streaming.questionPending = false
       const prev = streaming
-      const segments = [streamingTimeline(prev), "✅ 已收到你的回答，继续处理中…", [...prev.parts.values()].join("\n").trim()]
+      const segments = [streamingTimeline(prev), "✅ 已收到你的回答，继续处理中…", cardTail([...prev.parts.values()].join("\n").trim())]
       closeStreaming()
       resumeStreaming = true
       resumeBuffer = []

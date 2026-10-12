@@ -331,7 +331,7 @@ test("replay guard: LRU eviction at capacity", () => {
 
 // ---------- segmentation & session tag ----------
 
-import { splitContent } from "../dist/renderer.js"
+import { splitContent, cardTail, BODY_LIMIT, BODY_BYTE_LIMIT } from "../dist/renderer.js"
 import type { OutboundEvent as OutboundEventT } from "../dist/types.js"
 
 test("renderer: splitContent aggregates lines and hard-splits oversized lines", () => {
@@ -346,6 +346,25 @@ test("renderer: hard-splits a single line longer than limit", () => {
   const chunks = splitContent("y".repeat(3000), 1000)
   assert.equal(chunks.join(""), "y".repeat(3000))
   for (const c of chunks) assert.ok(c.length <= 1000)
+})
+
+test("renderer: splitContent respects UTF-8 byte cap (CJK heavy content)", () => {
+  // 纯中文 1200 字 ≈ 3600 字节 > 3000 字节上限，必须分页（飞书按字节截断长卡）
+  const body = Array.from({ length: 1200 }, (_, i) => `中文行${i}内容汉字填充`).join("\n")
+  const chunks = splitContent(body)
+  assert.ok(chunks.length > 1)
+  assert.equal(chunks.join("\n"), body) // 无损
+  for (const c of chunks) assert.ok(Buffer.byteLength(c, "utf8") <= BODY_BYTE_LIMIT)
+})
+
+test("renderer: cardTail keeps content within limits and marks omitted head", () => {
+  const body = Array.from({ length: 1200 }, () => "汉字填充内容很长的一段话").join("\n")
+  const tail = cardTail(body)
+  assert.ok(Buffer.byteLength(tail, "utf8") <= BODY_BYTE_LIMIT)
+  assert.ok(tail.startsWith("…\n"))
+  assert.ok(body.endsWith(tail.slice(2)))
+  assert.equal(cardTail("短文本"), "短文本")
+  assert.ok(BODY_LIMIT > 0 && BODY_BYTE_LIMIT > 0)
 })
 
 test("renderer: long summary produces multiple cards with (x/x) and session tag", () => {

@@ -29,6 +29,8 @@ function makeFakeApi(env: Record<string, string> = {}) {
     { info: { role: "assistant", modelID: "glm-test", providerID: "ark-test", agent: "plan" }, parts: [{ type: "text", text: "READY" }] },
   ]
   let sessionStatusType = "idle"
+  // 模拟服务端权威会话状态（v2 session.get 读这里，switchAgent/switchModel 写这里）
+  const serverSession: { agent?: string; model?: { providerID: string; modelID: string } } = {}
 
   const api = {
     app: { version: "1.18.35" },
@@ -91,9 +93,37 @@ function makeFakeApi(env: Record<string, string> = {}) {
         },
       },
       v2: {
+        agent: {
+          // 真实 v2 SDK 返回 { location, data: AgentV2Info[] } 包装（非数组），且 AgentV2Info 只有 id 字段
+          list: async () => ({
+            error: undefined,
+            data: {
+              location: { directory: "/tmp/fake", project: { id: "p", directory: "/tmp/fake" } },
+              data: [
+                { id: "build", description: "Build agent", mode: "primary", hidden: false },
+                { id: "plan", description: "Planning agent", mode: "primary", hidden: false },
+              ],
+            },
+          }),
+        },
         session: {
+          // 服务端会话状态（权威数据源）：初始为空 → 插件回落 TUI 状态/消息；switch 后立即反映
+          get: async () => ({
+            error: undefined,
+            data: { data: { id: "ses_current", agent: serverSession.agent, model: serverSession.model } },
+          }),
           prompt: async (args: unknown) => {
             clientCalls.push({ kind: "v2prompt", args })
+            return { error: undefined, data: {} }
+          },
+          switchAgent: async (args: unknown) => {
+            clientCalls.push({ kind: "switchAgent", args })
+            serverSession.agent = (args as { agent?: string }).agent
+            return { error: undefined, data: {} }
+          },
+          switchModel: async (args: unknown) => {
+            clientCalls.push({ kind: "switchModel", args })
+            serverSession.model = (args as { model?: { providerID: string; modelID: string } }).model
             return { error: undefined, data: {} }
           },
         },
@@ -131,6 +161,7 @@ function makeFakeApi(env: Record<string, string> = {}) {
     clientCalls,
     dialogState,
     disposers,
+    serverSession,
     setStatus: (t: string) => {
       sessionStatusType = t
     },
@@ -511,5 +542,151 @@ test("integration: agent question event produces question card with buttons", as
   assert.ok(q, "question_asked should be emitted")
   assert.equal(q.requestID, "q_test_1")
   fake.triggerEvent("question.replied", { properties: { requestID: "q_test_1" } })
+  fake.restoreEnv()
+})
+
+test("integration: /agent lists agents by id and /agent <n> switches via v2 switchAgent", async () => {
+  const { fake, stateDir } = await setup()
+  const { appendFileSync } = await import("node:fs")
+  // v2 AgentV2Info 只有 id 字段（没有 name）——列表必须显示真实 id 而非 undefined
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "ag1", command: { action: "agent_list" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  let events = readOutbox(stateDir)
+  const list = events.filter((e) => e.kind === "status").at(-1) as { text?: string } | undefined
+  assert.ok(list?.text?.includes("build（Build agent）"), "agent list must show id from AgentV2Info")
+  assert.ok(!list?.text?.includes("undefined"), "agent list must not contain undefined entries")
+
+  // 切换：/agent 2 → switchAgent({ agent: "plan" }) + 确认卡
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "ag2", command: { action: "agent_switch", index: 2 } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  const switches = fake.clientCalls.filter((c) => c.kind === "switchAgent")
+  assert.equal(switches.length, 1)
+  assert.equal((switches[0]!.args as { sessionID: string; agent: string }).agent, "plan")
+  assert.equal((switches[0]!.args as { sessionID: string }).sessionID, "ses_current")
+  events = readOutbox(stateDir)
+  const ack = events.filter((e) => e.kind === "status").at(-1) as { text?: string }
+  assert.ok(ack?.text?.includes("已切换 Agent"), "switch ack card should be sent")
+  fake.restoreEnv()
+})
+
+test("integration: TUI agent switch syncs to feishu; remote switch does not double-notify", async () => {
+  const { fake, stateDir } = await setup()
+  // TUI 本地切换 → session.next.agent.switched 事件 → 同步卡
+  fake.triggerEvent("session.next.agent.switched", {
+    properties: { sessionID: "ses_current", timestamp: Date.now(), messageID: "m1", agent: "build" },
+  })
+  await new Promise((r) => setTimeout(r, 100))
+  const events = readOutbox(stateDir)
+  const sync = events.filter((e) => e.kind === "status").at(-1) as { text?: string }
+  assert.ok(sync?.text?.includes("已切换 Agent"), "TUI agent switch should sync a status card")
+  assert.ok(sync?.text?.includes("build"))
+
+  // 远程 /agent 1 → 插件自管通知；窗口内的事件不再重复发卡
+  const { appendFileSync } = await import("node:fs")
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "ag3", command: { action: "agent_switch", index: 1 } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  const afterRemote = readOutbox(stateDir)
+  assert.equal(fake.clientCalls.filter((c) => c.kind === "switchAgent").length, 1)
+  const beforeEcho = afterRemote.length
+  fake.triggerEvent("session.next.agent.switched", {
+    properties: { sessionID: "ses_current", timestamp: Date.now(), messageID: "m2", agent: "build" },
+  })
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(readOutbox(stateDir).length, beforeEcho, "remote switch must not produce a duplicate event card")
+  fake.restoreEnv()
+})
+
+test("integration: permission card includes path patterns and metadata detail", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("permission.asked", {
+    properties: {
+      id: "per_ext",
+      sessionID: "ses_current",
+      permission: "external_directory",
+      patterns: ["/Users/me/OpenCodeHome/other-project"],
+      metadata: { filepath: "/Users/me/OpenCodeHome/other-project/file.txt" },
+    },
+  })
+  await new Promise((r) => setTimeout(r, 200))
+  const events = readOutbox(stateDir)
+  const card = events.find((e) => e.kind === "permission_requested") as
+    | { patterns?: string[]; detail?: string }
+    | undefined
+  assert.ok(card, "permission_requested should be emitted")
+  assert.deepEqual(card.patterns, ["/Users/me/OpenCodeHome/other-project"])
+  assert.ok(card.detail?.includes("other-project/file.txt"), "metadata detail should carry the full path")
+  fake.restoreEnv()
+})
+
+test("integration: disconnect posts warning toast and persistent TUI notice (noReply)", async () => {
+  const { fake, stateDir } = await setup()
+  const toastCountBefore = fake.toasts.length
+  const { appendFileSync } = await import("node:fs")
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "d1", command: { action: "stop" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  // warning toast（不再是 error/info 风格）
+  const toast = fake.toasts[toastCountBefore]
+  assert.ok(toast, "stop should produce a toast")
+  assert.equal(toast?.variant, "warning")
+  assert.ok(toast?.message.includes("remote stop"))
+  // 会话内持久通知：noReply prompt，不触发 agent 回复
+  const notices = fake.clientCalls.filter((c) => c.kind === "prompt" && (c.args as { noReply?: boolean }).noReply === true)
+  assert.equal(notices.length, 1)
+  const args = notices[0]!.args as { sessionID: string; parts: Array<{ type: string; text: string }> }
+  assert.equal(args.sessionID, "ses_current")
+  assert.ok(args.parts[0]!.text.includes("飞书分享已断开"))
+  fake.restoreEnv()
+})
+
+test("integration: after remote /agent switch, next prompt and list use the NEW agent (server truth)", async () => {
+  const { fake, stateDir } = await setup()
+  const { appendFileSync } = await import("node:fs")
+  // 远程切换 → 服务端状态变为 build（TUI 本地状态/历史消息仍是旧的 plan，不能被钉回）
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "sw1", command: { action: "agent_switch", index: 1 } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  assert.equal(fake.serverSession.agent, "build")
+
+  // 切换后立即查询：当前 Agent 必须显示新值（服务端权威），而非消息兜底的旧值
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "sw2", command: { action: "agent_list" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  let events = readOutbox(stateDir)
+  const list = events.filter((e) => e.kind === "status").at(-1) as { text?: string }
+  assert.ok(list?.text?.includes("当前 Agent**：build"), "agent list must reflect the switched agent, got: " + list?.text)
+
+  // 切换后远程 prompt：沿用新 agent（不把旧 agent 钉回去）
+  appendFileSync(join(stateDir, "inbox.jsonl"), `${JSON.stringify({ senderID: "ou_tester", chatID: "mock-chat", messageID: "sw3", command: { action: "prompt", text: "继续任务" } })}\n`)
+  await new Promise((r) => setTimeout(r, 700))
+  const prompts = fake.clientCalls.filter((c) => c.kind === "prompt")
+  assert.equal(prompts.length, 1)
+  const args = prompts[0]!.args as { agent?: string; model?: { providerID: string; modelID: string } }
+  assert.equal(args.agent, "build")
+  // 服务端状态里 model 为空 → 回落最后一条消息的 model（ark-test/glm-test），agent 用服务端新值
+  assert.deepEqual(args.model, { providerID: "ark-test", modelID: "glm-test" })
+  fake.restoreEnv()
+})
+
+test("integration: long final streaming text is split into multiple cards", async () => {
+  const { fake, stateDir } = await setup()
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "busy" } } })
+  await new Promise((r) => setTimeout(r, 120))
+  const longText = Array.from({ length: 400 }, (_, i) => `中文段落第${i}行，这里有足够多的汉字内容用于触发字节上限的分页切分逻辑`).join("\n")
+  fake.triggerEvent("message.part.updated", {
+    properties: { sessionID: "ses_current", part: { id: "p_long", type: "text", text: longText } },
+  })
+  await new Promise((r) => setTimeout(r, 1400))
+  fake.triggerEvent("session.status", { properties: { sessionID: "ses_current", status: { type: "idle" } } })
+  await new Promise((r) => setTimeout(r, 500))
+  const events = readOutbox(stateDir)
+  const finalUpdate = events.filter((e) => e.kind === "card_update").at(-1) as
+    | { card?: { header?: { title?: { content?: string } } } }
+    | undefined
+  assert.ok(finalUpdate?.card?.header?.title?.content?.includes("任务完成 (1/"), "first page should stay on the streaming card")
+  const pages = events.filter((e) => e.kind === "card_send") as Array<{ card?: { header?: { title?: { content?: string } }; body?: { elements?: Array<{ tag: string; content?: string }> } } }>
+  assert.ok(pages.length >= 1, "continuation pages should be sent as new cards")
+  assert.ok(pages[0]?.card?.header?.title?.content?.includes("(2/"), "second page title should carry (2/N)")
+  // 分页无损：所有页正文拼回应包含首尾内容
+  const all = JSON.stringify(events.filter((e) => e.kind === "card_update" || e.kind === "card_send"))
+  assert.ok(all.includes("中文段落第0行"), "head content preserved")
+  assert.ok(all.includes("中文段落第399行"), "tail content preserved")
   fake.restoreEnv()
 })
