@@ -1,8 +1,8 @@
-# TODO — 多 Session 分享与切换（下一步计划）
+# TODO — 多 Session 分享与切换（已完成并发布）
 
-> 状态：**已实施**（0.2.0，2026-10-17；实施结果与本计划的差异见文末备注）
-> 目标版本：0.2.0
-> 背景_issue：单 session 分享已稳定（0.1.x）；需支持同一 TUI 同时分享多个 session，并在飞书端切换。
+> 状态：**已完成 & 已发布 v0.2.0**（2026-10-18 提交 2f3b85b + tag，`*.tgz` 已产出）
+> 目标版本：0.2.0（同 TUI 多会话 + 跨 TUI leader/follower 中继一并交付）
+> 背景_issue：单 session 分享已稳定（0.1.x）；需支持同 TUI 多 session 与跨 TUI 进程并行分享，并在飞书端统一切换。
 
 ## 1. 需求（用户原话归纳）
 
@@ -24,20 +24,17 @@
 | 卡片标题已带 `sessionTag`（会话摘要） | 继续沿用；非当前 session 的卡片需要更明显的归属标记 |
 | 飞书文本指令解析（router.ts）无 `/session` | 新增 `/session`、`/session <n>` |
 
-## 3. 设计决策（实施前先定案）
+## 3. 设计决策（全部已定案并实施）
 
-- [ ] **D1 默认/active 语义**：`activeSessionID` = 飞书指令（prompt、/status、/stop、/approve…）的作用对象。
+- [x] **D1 默认/active 语义**：`activeSessionID` = 飞书指令（prompt、/status、/stop、/approve…）的作用对象。
   - 第一个分享 → 自动成为 active（满足需求 2）。
   - 后续分享 → **不改变 active**（满足需求 5），只发提醒卡。
-- [ ] **D2 提醒卡样式**：新 session 分享时发一张 `multi_session` 卡：列出全部已分享 session（当前 active 加 ★ 标记），注明"新会话已接入，发送 /session <n> 切换"。可选：卡上加「切换到此会话」按钮（behaviors callback，值由渲染器写入）。
-- [ ] **D3 `/session` 语法**：`/session` = 列表（含序号、标题、★当前）；`/session <n>` = 切换到第 n 个。序号按**分享顺序**（稳定，避免切换后序号漂移）。切换成功后回一张**「已切换」卡**，内容三段式：
-  1. **明确提醒**：开头即 `✅ 已切换到会话：<标题>`（旧 active 的后续事件卡不再视为当前，提示用户后续 prompt 将发往新会话）；
-  2. **简要历史 summary**：会话标题、消息数、状态（busy/idle）、待办完成度、累计费用等（复用 `buildSnapshot` + `buildStatusText` 的能力，超长按 `splitContent` 分页）；
-  3. **最新一次交互记录**：最近一条 user prompt 原文（截断 ~300 字）+ 最近一条 assistant 回复摘要（截断 ~600 字，复用 `summarize` 的 `lastUserText`/`lastAssistantText`；任一缺失时显示"（无）"）。
-- [ ] **D4 停止语义**：`/disconnect` = 断开 **当前 active** 的 session；零个 session 残留时才关闭 transport（WS）+ 收尾。`/disconnect all`（可选）= 全部断开。TUI 菜单 Stop 同语义（stop active）。
-- [ ] **D5 多 session 事件并发**：所有已分享 session 的 TUI 事件都转发到飞书（各自带 sessionTag）；非 active session 的流式卡正常运行。可选增强：非 active 的事件卡标题加「（后台）」前缀。
-- [ ] **D6 chatID 模型**：保持每 target 自带 chatID（现状字段已支持）；典型场景仍是一个默认群。若两个 session 分享到**不同 chat**，入站指令按 `ctx.chatID → sessionID` 精确路由（比 active 优先级更高）。
-- [ ] **D7 忙时排队**：`promptQueue` 改为 per-session；对非 active session 的 prompt 是否允许？（建议：允许直达该 session，指令带 session 前缀的场景后置到 v0.3）
+- [x] **D2 提醒卡样式**：新 session 分享时发 `multi_session_new` 卡：列出全部已分享 session（当前 active 加 ★ 标记），含「切换到此会话」按钮（behaviors callback，值由渲染器写入）。
+- [x] **D3 `/session` 语法**：`/session` = 列表（含序号、标题、★当前）；`/session <n>` = 切换到第 n 个（分享顺序，切换后不漂移）。切换卡三段式（标题即提醒 + 会话概览 + 最近一次交互，任一缺失显示"（无）"）。**增强**：列表卡 ≤4 会话给一键按钮行、>4 给下拉表单。
+- [x] **D4 停止语义**：`/disconnect` = 断开当前 active（可为跨实例会话，定向转发）；`/disconnect all` = 全部断开；零残留才关 transport。TUI 菜单 Stop 只停本进程 active。
+- [x] **D5 多 session 事件并发**：所有已分享 session 的事件都到飞书；流式卡按 session 隔离并发；非 active 会话卡标题带「（后台）」前缀。
+- [x] **D6 chatID 模型**：每 target 自带 chatID；入站指令按 `ctx.chatID → sessionID` 精确路由（比 active 优先级高），多会话同 chat 时取 active。
+- [x] **D7 忙时排队**：`promptQueues` per-session；跨实例 prompt 允许直达属主 session（经中继转发）。
 
 ## 4. 实施步骤
 
@@ -69,9 +66,9 @@
 
 - [x] 需求 1-5 全部有集成测试覆盖
 - [x] 切换体验：`/session <n>` 的回复卡能让用户不看 TUI 就知道"切到了哪个会话、这个会话之前聊了什么、最近一次交互是什么"
-- [x] `npm run typecheck && npm test` 全绿（88 个测试）
-- [ ] 真实飞书手测：分享 A → 分享 B（A 的流式卡不中断，飞书收到 B 接入提醒）→ `/session 2` 切到 B（收到的卡含 B 的历史 summary 与最近交互）→ 发 prompt 落在 B → `/disconnect`（断 B）→ A 仍可交互
-- [x] README / AGENTS.md 同步更新（AGENTS.md 的"事件方向速查"与状态机描述）
+- [x] `npm run typecheck && npm test` 全绿（最终 100 个测试）
+- [x] 真实飞书手测（2026-10-18）：跨 TUI 分享 A/B、B 接入提醒卡、`/session 2` 切换卡含历史与最近交互、prompt 落属主 TUI、`/disconnect` 定向断开、leader 退出 follower 接管——全部通过（含一次"卡在正在处理"的误报，经飞书服务端 API 核实为截图时序，绿卡 0.5s 后已落地）
+- [x] README / AGENTS.md / docs 同步更新（AGENTS.md 坑 17/18/19、多 session 语义、发布流程）
 
 ## 6. 风险与备注
 
@@ -100,3 +97,15 @@
 - 测试 94 个全绿（新增 6 个跨 TUI 集成：follower 接入/跨实例切换与路由/定向断开/leader 退出接管/权限转发/陈旧锁接管）
 - 后续增强（同日）：`/session` 列表卡支持卡片直接切换——≤4 个会话给一键按钮行（当前会话 ★ 不高亮），>4 个给下拉表单（select_static + 切换按钮，复用 question_form 的 form_value 合并机制，`cardActionToCommand` 解析 `form.session_index`）；共 99 个测试全绿
 - 约束：同机共享 `FEISHU_SHARE_STATE_DIR`；跨机器需各配不同 `FEISHU_APP_ID`
+
+## 9. 发布记录
+
+- **v0.2.0**（2026-10-18）：提交 2f3b85b（含 0.2.0 全部功能：同 TUI 多会话 + 跨 TUI 中继 + 卡片切换交互 + 空文本防回退等修复）；`npm run typecheck && npm test` 100/100 全绿；`npm pack` 出 `opencode-feishu-share-0.2.0.tgz`（53K）；tag `v0.2.0`。最后一步：修复空 text part 回退与同步应答文案后终验 100 个测试。
+
+## 10. 下一步候选（未排期）
+
+- **流式刷新延迟**：中继链路下卡片刷新 ~1.2s 间隔 + ~0.4s 跳转，长回合观感偏慢；可评估飞书 cardkit 流式接口
+- **移动端卡片更新渲染滞后**：已打开的聊天里更新卡有时不即时重绘（飞书客户端行为，进出聊天可见新内容）——关注飞书端改进或换 cardkit
+- **requestID 选择器跨实例歧义**：`#latest`/`#n` 在 leader 自身有 pending 时优先解析 leader，follower 的选择器需用卡片上的显式 requestID；可改为全局统一序号
+- **跨机器多 TUI**：当前同机共享 stateDir 才能组队；跨机器方案（如经飞书群消息自举/第二 App）待定
+- **会话级指令前缀**：`/s2 <text>` 之类直达指定会话的语法（D7 尾注）
