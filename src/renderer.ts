@@ -87,6 +87,10 @@ const SESSION_TAG_MAX = 28
 const TABLE_MAX_ROWS = 40
 /** 表格按钮化的最大选项数 */
 const QUESTION_BUTTON_MAX = 6
+/** 会话切换按钮行最大数量；超过改用下拉表单 */
+const SESSION_BUTTON_MAX = 4
+/** 会话切换下拉的最大选项数（超过截断，提示用 /session <n>） */
+const SESSION_SELECT_MAX = 20
 /** 表单下拉的最大选项数（超过则回退为输入框） */
 const QUESTION_SELECT_MAX = 20
 
@@ -97,11 +101,12 @@ export const HELP_TEXT = [
   "`/recent` — 最近执行结果",
   "`/model` — 查看模型列表；`/model <n>` — 切换模型",
   "`/agent` — 查看 Agent 列表；`/agent <n>` — 切换 Agent",
+  "`/session` — 查看会话列表；`/session <n>` — 切换会话（列表卡上也可点按钮/下拉切换）",
   "`/stop` — 停止当前执行",
   "`/approve [n] [always]` — 批准待审批权限（默认最新）",
   "`/deny [n]` — 拒绝待审批权限",
   "`/answer <选项>` — 回答 Agent 提问",
-  "`/disconnect` — 断开分享（不中止本地任务）",
+  "`/disconnect [all]` — 断开当前会话分享（all=全部；不中止本地任务）",
 ].join("\n")
 
 /** 飞书卡片 markdown 中 `{{ }}` 是变量语法，注入前转义 */
@@ -309,6 +314,70 @@ function snapshotMd(s: SessionSnapshot): string {
     .join("\n")
 }
 
+/** 会话列表条目 → 行（★ 标记当前会话，序号 = 分享顺序） */
+function sessionListLines(sessions: Array<{ sessionID: string; title?: string; active: boolean }>): string[] {
+  return sessions.map((s, i) => {
+    const title = s.title?.trim() || s.sessionID
+    return `**${i + 1}.** ${s.active ? "★ **" + escapeLarkMd(title) + "**" : escapeLarkMd(title)}`
+  })
+}
+
+/** 「切换到此会话」按钮（回调 value 走 cardActionToCommand 白名单） */
+function sessionSwitchButton(index: number): FeishuCardElement {
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: "切换到此会话" },
+    type: "primary",
+    size: "medium",
+    behaviors: [{ type: "callback", value: { kind: "session_switch", index } }],
+  }
+}
+
+/**
+ * 会话切换交互：≤4 个会话 → 按钮行（一键切换）；更多 → 下拉表单 + 切换按钮。
+ * 表单提交回调的 form_value（键 session_index）由 lark.ts 合并进 value.form，
+ * cardActionToCommand 据此解析成 session_switch。
+ */
+export function buildSwitchActions(sessions: Array<{ sessionID: string; title?: string; active: boolean }>): FeishuCardElement[] {
+  if (sessions.length === 0) return []
+  const label = (s: { sessionID: string; title?: string }, i: number): string =>
+    `${i + 1}. ${s.title?.trim() || s.sessionID}`.slice(0, 60)
+  if (sessions.length <= SESSION_BUTTON_MAX) {
+    return sessions.map((s, i) => ({
+      tag: "button",
+      text: { tag: "plain_text", content: `${s.active ? "★ " : ""}${label(s, i)}` },
+      type: s.active ? "default" : "primary",
+      size: "medium",
+      behaviors: [{ type: "callback", value: { kind: "session_switch", index: i + 1 } }],
+    }))
+  }
+  return [
+    {
+      tag: "form",
+      name: "session_switch_form",
+      elements: [
+        {
+          tag: "select_static",
+          name: "session_index",
+          options: sessions.slice(0, SESSION_SELECT_MAX).map((s, i) => ({
+            text: { tag: "plain_text", content: `${s.active ? "★ " : ""}${label(s, i)}` },
+            value: String(i + 1),
+          })),
+          placeholder: { tag: "plain_text", content: "选择要切换的会话" },
+        },
+        {
+          tag: "button",
+          name: "submit_session_switch",
+          action_type: "form_submit",
+          text: { tag: "lark_md", content: "切换" },
+          type: "primary",
+          value: { kind: "session_switch" },
+        },
+      ],
+    },
+  ]
+}
+
 /** 单个事件的（标题, 颜色, 正文, note, 额外按钮行, 额外表单元素） */
 function cardParts(event: OutboundEvent): {
   title: string
@@ -446,6 +515,57 @@ function cardParts(event: OutboundEvent): {
       return { title: "ℹ️ 状态", template: "turquoise", body: event.text || "(empty)" }
     case "tui_input":
       return { title: "👤 TUI 输入", template: "turquoise", body: event.text || "(empty)" }
+    case "multi_session_new": {
+      const lines = sessionListLines(event.sessions)
+      const target = event.sessions[event.newIndex - 1]
+      return {
+        title: "🆕 新会话已接入分享",
+        template: "blue",
+        body: [
+          "当前多会话并行分享中，已有会话的分享**不受影响**：",
+          ...lines,
+          "",
+          `新接入的会话：**${target?.title ?? event.sessionID}**（当前会话仍为 ★ 标记项）`,
+          "发送 **/session <n>** 切换当前会话（序号为分享顺序）",
+        ].join("\n"),
+        note: `session ${event.sessionID}`,
+        actions: [sessionSwitchButton(event.newIndex)],
+      }
+    }
+    case "session_list": {
+      const rows = sessionListLines(event.sessions)
+      const acts = buildSwitchActions(event.sessions)
+      return {
+        title: "🗂️ 会话列表",
+        template: "blue",
+        body: [...rows, "", "点按钮/下拉直接切换（★ = 当前会话）；也可发送 **/session <n>**"].join("\n"),
+        note: `共 ${event.sessions.length} 个已分享会话`,
+        actions: acts,
+      }
+    }
+    case "session_switched": {
+      const swTitle = event.sessionTitle?.trim() || event.sessionID
+      const shown = swTitle.length > 40 ? `${swTitle.slice(0, 40)}…` : swTitle
+      const interaction = [
+        `**👤 User**：${event.lastUserText ? escapeLarkMd(event.lastUserText.slice(0, 300)) : "（无）"}`,
+        "",
+        `**🤖 Assistant**：${event.lastAssistantText ? escapeLarkMd(event.lastAssistantText.slice(0, 600)) : "（无）"}`,
+      ].join("\n")
+      return {
+        title: `✅ 已切换到会话：${shown}`,
+        template: "green",
+        body: [
+          "后续 prompt 将发送到该会话；原会话的事件卡仍会同步，但不再是当前会话。",
+          "",
+          "**—— 会话概览 ——**",
+          event.statusText || "（无状态信息）",
+          "",
+          "**—— 最近一次交互 ——**",
+          interaction,
+        ].join("\n"),
+        note: `session ${event.sessionID}`,
+      }
+    }
     default:
       return { title: "ℹ️ 通知", template: "grey", body: "" }
   }

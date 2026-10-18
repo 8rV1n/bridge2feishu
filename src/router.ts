@@ -13,7 +13,9 @@ import type { InboundCommand, InboundContext } from "./types.js"
  *   /approve [n] [always]        批准待审批权限（默认最新一个；n 为通知序号）
  *   /deny [n]                    拒绝待审批权限
  *   /answer <选项文本>            回答最近的交互式问题
- *   /disconnect                  断开分享（不中止本地任务）
+ *   /session                     查看已分享会话列表
+ *   /session <n>                 切换当前会话（n 为分享顺序序号）
+ *   /disconnect [all]            断开当前会话分享（all=全部；不中止本地任务）
  * 未知斜杠指令返回 null（忽略）。
  * requestID 使用 "#latest"/"#n" 占位，由 SessionController 按待处理顺序解析。
  */
@@ -48,7 +50,12 @@ export function parseFeishuCommand(
     case "/stop":
       return { action: "abort" }
     case "/disconnect":
-      return { action: "stop" }
+      return rest.toLowerCase() === "all" ? { action: "stop", scope: "all" } : { action: "stop" }
+    case "/session": {
+      if (!rest) return { action: "session_list" }
+      const n = Number(rest.split(" ")[0])
+      return Number.isInteger(n) && n >= 1 ? { action: "session_switch", index: n } : null
+    }
     case "/approve":
     case "/deny": {
       const parts = rest.split(" ").filter(Boolean)
@@ -95,7 +102,18 @@ export function cardActionToCommand(value: unknown): InboundCommand | null {
     label?: string
     text?: string
     count?: number
+    index?: number
     form?: Record<string, unknown>
+  }
+  if (v.kind === "session_switch" && Number.isInteger(v.index) && (v.index as number) >= 1) {
+    return { action: "session_switch", index: v.index as number }
+  }
+  // 下拉表单提交：lark.ts 已把 form_value 合并进 value.form（键 session_index）
+  if (v.kind === "session_switch" && v.form && typeof v.form === "object") {
+    const sel = (v.form as Record<string, unknown>).session_index
+    const n = Number(sel)
+    if (Number.isInteger(n) && n >= 1) return { action: "session_switch", index: n }
+    return null
   }
   if (v.kind === "permission" && typeof v.requestID === "string") {
     const reply = v.reply === "always" ? "always" : v.reply === "reject" ? "reject" : "once"

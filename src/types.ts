@@ -1,7 +1,14 @@
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 
 export const PLUGIN_ID = "opencode-feishu-share"
-export const PLUGIN_VERSION = "0.1.0"
+export const PLUGIN_VERSION = "0.2.0"
+
+/** 多 session 分享：列表条目（active 为飞书指令的当前作用对象） */
+export type SessionListEntry = {
+  sessionID: string
+  title?: string
+  active: boolean
+}
 
 export type ShareStatus = "unshared" | "shared"
 
@@ -31,6 +38,18 @@ export type OutboundEvent =
       | { kind: "status"; sessionID: string; chatID: string; text: string }
       | { kind: "tui_input"; sessionID: string; chatID: string; text: string }
       | { kind: "card_update"; sessionID: string; chatID: string; messageID: string; card: unknown }
+      | { kind: "multi_session_new"; sessionID: string; chatID: string; sessions: SessionListEntry[]; newIndex: number }
+      | { kind: "session_list"; sessionID: string; chatID: string; sessions: SessionListEntry[] }
+      | {
+          kind: "session_switched"
+          sessionID: string
+          chatID: string
+          previousSessionID?: string
+          statusText: string
+          messageCount?: number
+          lastUserText?: string
+          lastAssistantText?: string
+        }
     )
     & { sessionTitle?: string })
 
@@ -50,13 +69,15 @@ export type InboundCommand =
   | { action: "abort" }
   | { action: "permission_reply"; requestID: string; reply: "once" | "always" | "reject" }
   | { action: "question_reply"; requestID: string; answers: string[] | string[][] }
-  | { action: "stop" }
+  | { action: "stop"; scope?: "active" | "all"; targetSessionID?: string }
   | { action: "help" }
   | { action: "question_custom"; requestID: string }
   | { action: "model_list" }
   | { action: "model_switch"; index: number }
   | { action: "agent_list" }
   | { action: "agent_switch"; index: number }
+  | { action: "session_list" }
+  | { action: "session_switch"; index: number }
 
 /** 飞书（或 Mock）传输层接口：TUI → 飞书 为 send/update，飞书 → TUI 为 inbound 回调 */
 export type FeishuTransport = {
@@ -68,7 +89,7 @@ export type FeishuTransport = {
   sendCard(card: unknown): Promise<string | undefined>
   /** 原地更新一张已发送卡片的内容（流式刷新/按钮点击后置灰） */
   updateCard(messageID: string, card: unknown): Promise<void>
-  onInbound(handler: (cmd: InboundCommand, ctx: InboundContext) => void): void
+  onInbound(handler: (cmd: InboundCommand, ctx: InboundContext, opts?: { targetSessionID?: string }) => void): void
   /** 卡片按钮点击回调（value 为渲染时写入按钮的 JSON） */
   onCardAction(handler: (value: unknown, ctx: InboundContext, messageID?: string) => void): void
 }

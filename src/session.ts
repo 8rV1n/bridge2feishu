@@ -43,11 +43,13 @@ export function summarize(
   messages: Array<{ info: Message; parts: Array<Part> }>,
 ): SessionSummary {
   const lastUser = [...messages].reverse().find((m) => m.info.role === "user")
+  const userText = lastUser ? textOfMessage(lastUser) : ""
   return {
     id: session?.id ?? "",
     title: session?.title,
     messageCount: messages.length,
-    lastUserText: lastUser ? lastAssistantText([lastUser]) : undefined,
+    // 注意：不能走 lastAssistantText（它只认 assistant 角色）；user 消息直接取 text parts
+    lastUserText: userText ? (userText.length > 600 ? `${userText.slice(0, 600)}…` : userText) : undefined,
     lastAssistantText: lastAssistantText(messages),
   }
 }

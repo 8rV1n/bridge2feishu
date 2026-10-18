@@ -1,5 +1,5 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import type { InboundCommand, InboundContext, OutboundEvent, SessionSnapshot } from "./types.js"
+import type { InboundCommand, InboundContext, OutboundEvent, SessionListEntry, SessionSnapshot } from "./types.js"
 import { appendFileSync } from "node:fs"
 import { loadConfig, type PluginConfig } from "./config.js"
 import { ShareStateManager } from "./share-state.js"
@@ -7,6 +7,9 @@ import { Security } from "./security.js"
 import { lastAssistantText, summarize, textOfMessage } from "./session.js"
 import { MockTransport } from "./transport/mock.js"
 import { createTransport } from "./transport/index.js"
+import { RelayTransport } from "./transport/relay.js"
+import { LeaderHub } from "./hub.js"
+import { acquireTransportLock, newInstanceID } from "./lock.js"
 import { renderOutbound, renderStreamingCard, renderProcessedCard, splitContent, cardTail, HELP_TEXT } from "./renderer.js"
 import { cardActionToCommand } from "./router.js"
 
@@ -16,9 +19,14 @@ export const id = "opencode-feishu-share"
 
 export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const config: PluginConfig = loadConfig()
+  const instanceID = newInstanceID()
   const share = new ShareStateManager()
   const security = new Security(config)
-  let transport: ReturnType<typeof createTransport> | null = null
+  let transport: ReturnType<typeof createTransport> | RelayTransport | null = null
+  let releaseTransportLock: (() => void) | null = null
+  // 跨 TUI 进程协作：followerMode = 本进程不直连飞书（leader 持锁）；hub = leader 侧中继枢纽
+  let followerMode = false
+  let hub: LeaderHub | null = null
   // 事件流调试日志（FEISHU_SHARE_DEBUG=1 时启用，排查事件时序用）
   const dbg = ((msg: string): void => {
     if (process.env.FEISHU_SHARE_DEBUG !== "1") return
@@ -35,8 +43,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const pendingQuestions = new Map<string, unknown>()
   const permissionOrder: string[] = []
   const questionOrder: string[] = []
-  // 会话忙时的远程 prompt 队列（对齐 TUI 本地排队语义）
-  const promptQueue: string[] = []
+  // 会话忙时的远程 prompt 队列（对齐 TUI 本地排队语义）——按 session 隔离
+  const promptQueues = new Map<string, string[]>()
   // TUI 本地输入镜像：用户消息 ID 集合 / 已镜像 part / 插件注入 prompt 记录（防回声）
   const userMessageIDs = new Set<string>()
   const mirroredParts = new Set<string>()
@@ -46,6 +54,81 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   let agentCache: Array<{ name: string; label: string }> = []
   // 远程切换 agent/model 的回声抑制窗口：插件自己调用 switch API 后短暂屏蔽事件同步，避免飞书重复通知
   let remoteSwitchUntil = 0
+
+  /** 某 session 的排队队列（无则建空队列） */
+  const queueOf = (sessionID: string): string[] => {
+    let q = promptQueues.get(sessionID)
+    if (!q) {
+      q = []
+      promptQueues.set(sessionID, q)
+    }
+    return q
+  }
+
+  /** 事件卡归属标记：单会话不标注；多会话时非 active 会话标（后台） */
+  const titleFor = (sessionID: string): string | undefined => {
+    const title = api.state.session.get(sessionID)?.title
+    if (!title) return title
+    if (share.count > 1 && share.activeSessionID !== sessionID) return `（后台）${title}`
+    return title
+  }
+
+  /** 事件发送的目标 chatID：优先该 session 分享时绑定的 chat，兜底默认 chat */
+  const chatIDFor = (sessionID: string): string =>
+    share.targetOf(sessionID)?.chatID ?? (config.defaultChatID || "mock")
+
+  /** /session 列表条目（全局分享顺序 + 当前标记；标题：本进程走 state，follower 走注册表） */
+  const sessionListEntries = (): SessionListEntry[] =>
+    share.list().map((t) => {
+      const extPID = share.externalOwnerOf(t.sessionID)
+      let title: string | undefined
+      if (extPID === undefined) {
+        title = api.state.session.get(t.sessionID)?.title
+      } else {
+        const fs = hub?.followerSession(t.sessionID)
+        title = fs?.title
+      }
+      return {
+        sessionID: t.sessionID,
+        title,
+        active: t.sessionID === share.activeSessionID,
+      }
+    })
+
+  /** follower 模式：把本进程会话与快照写进注册表（leader 据此列表/切换/渲染卡片标题） */
+  const followerSessions = async (): Promise<Array<{ sessionID: string; chatID: string; title?: string; snapshot?: import("./relay.js").SwitchSnapshot }>> => {
+    const out: Array<{ sessionID: string; chatID: string; title?: string; snapshot?: import("./relay.js").SwitchSnapshot }> = []
+    for (const t of share.list().filter((x) => !share.externalOwnerOf(x.sessionID))) {
+      const sid = t.sessionID
+      const msgs = await fetchMessages(sid, 20).catch(() => [])
+      const sm = summarize(api.state.session.get(sid), msgs as never)
+      out.push({
+        sessionID: sid,
+        chatID: t.chatID,
+        title: api.state.session.get(sid)?.title,
+        snapshot: {
+          title: api.state.session.get(sid)?.title,
+          messageCount: sm.messageCount,
+          status: api.state.session.status(sid)?.type ?? "idle",
+          statusText: await buildStatusText(sid).catch(() => ""),
+          lastUserText: sm.lastUserText,
+          lastAssistantText: sm.lastAssistantText,
+        },
+      })
+    }
+    return out
+  }
+
+  const publishFollowerMeta = async (): Promise<void> => {
+    if (!followerMode || !(transport instanceof RelayTransport)) return
+    const relay = transport as RelayTransport
+    const sessions = await followerSessions()
+    try {
+      relay.publishSessions(sessions)
+    } catch {
+      // 注册表刷新失败不阻塞
+    }
+  }
 
   const listModels = (): Array<{ providerID: string; modelID: string; label: string }> => {
     if (modelCache.length > 0) return modelCache
@@ -90,10 +173,10 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   const emit = async (event: OutboundEvent): Promise<string | undefined> => {
     if (!transport) return undefined
-    // 自动注入会话摘要（卡片标题显示用）
+    // 自动注入会话摘要（卡片标题显示用；多会话时后台会话加（后台）标记）
     const withTitle: OutboundEvent =
       event.sessionID && !event.sessionTitle
-        ? { ...event, sessionTitle: api.state.session.get(event.sessionID)?.title }
+        ? { ...event, sessionTitle: titleFor(event.sessionID) }
         : event
     try {
       return await transport.send(withTitle)
@@ -114,25 +197,38 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     lastFlush: number
     timer: ReturnType<typeof setTimeout> | null
   }
-  let streaming: Streaming | null = null
+  // 流式卡状态机按 session 隔离：多会话并发流式互不覆盖 messageID
+  const streaming = new Map<string, Streaming>()
   const STREAM_INTERVAL_MS = 1200
   const TIMELINE_MAX = 6
-  // 提问回答后的续段流式：旧卡定格，agent 继续产出时开新卡（保证回复在飞书消息底部可见）
-  let resumeStreaming = false
-  let resumeOpening = false
-  let resumeBuffer: Array<{ id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }> = []
+  // 提问回答后的续段流式：旧卡定格，agent 继续产出时开新卡（保证回复在飞书消息底部可见）——按 session 隔离
+  type ResumeState = { active: boolean; opening: boolean; buffer: Array<{ id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }> }
+  const resumeStates = new Map<string, ResumeState>()
+  const resumeStateOf = (sessionID: string): ResumeState => {
+    let rs = resumeStates.get(sessionID)
+    if (!rs) {
+      rs = { active: false, opening: false, buffer: [] }
+      resumeStates.set(sessionID, rs)
+    }
+    return rs
+  }
+  // busy 已声明但流式卡未就绪期间到达的 parts（中继/WS 延迟窗口）：先缓冲，卡就绪后回放
+  const pendingParts = new Map<string, Array<{ id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } }>>()
 
   /** 把一个 message part 应用到流式卡（text→正文 / tool→时间线 / reasoning→思考中） */
   const applyPartToStreaming = (
+    sessionID: string,
     target: Streaming,
     p: { id?: string; type?: string; text?: string; tool?: string; state?: { status?: string; title?: string } },
   ): void => {
     if (!target || !p?.id) return
     if (p.type === "text") {
+      // 空 text part（如 step 占位）不覆盖已有内容/思考状态，避免卡片"回退"观感
+      if (p.text === undefined || p.text === "") return
       target.textPartIDs.add(p.id)
-      target.parts.set(p.id, p.text ?? "")
+      target.parts.set(p.id, p.text)
       target.reasoningActive = false
-      scheduleStreamingFlush()
+      scheduleStreamingFlush(sessionID)
       return
     }
     if (p.type === "tool") {
@@ -141,33 +237,34 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         // 按工具状态同步等待标志（answered 后不再误显示"等待你的回答"）
         const st = p.state?.status
         target.questionPending = !(st === "completed" || st === "error")
-        scheduleStreamingFlush()
+        scheduleStreamingFlush(sessionID)
         return
       }
       const title = p.state?.title || p.tool || "工具"
       target.questionPending = false
       target.tools.set(p.id, { tool: p.tool ?? "tool", title, status: p.state?.status ?? "pending" })
-      scheduleStreamingFlush()
+      scheduleStreamingFlush(sessionID)
       return
     }
     if (p.type === "reasoning" && target.parts.size === 0) {
       target.reasoningActive = true
-      scheduleStreamingFlush()
+      scheduleStreamingFlush(sessionID)
     }
   }
 
   /** 回答后开新流式卡：先落卡，再把等卡期间的 parts 按序回放进去 */
   const openResumeCard = (sessionID: string): void => {
-    resumeOpening = true
-    dbg(`resume-card opening buffer=${resumeBuffer.length}`)
+    const rs = resumeStateOf(sessionID)
+    rs.opening = true
+    dbg(`resume-card opening session=${sessionID.slice(0, 12)} buffer=${rs.buffer.length}`)
     void (async () => {
-      const messageID = await emit({ kind: "task_resumed", sessionID, chatID: share.current?.chatID ?? "mock" })
+      const messageID = await emit({ kind: "task_resumed", sessionID, chatID: chatIDFor(sessionID) })
       if (!messageID) {
         dbg("resume-card open FAILED (no messageID)")
-        resumeOpening = false
+        rs.opening = false
         return
       }
-      dbg(`resume-card opened ${messageID.slice(0, 16)} replay=${resumeBuffer.length}`)
+      dbg(`resume-card opened ${messageID.slice(0, 16)} replay=${rs.buffer.length}`)
       const s: Streaming = {
         messageID,
         parts: new Map(),
@@ -178,19 +275,19 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         lastFlush: 0,
         timer: null,
       }
-      for (const part of resumeBuffer) applyPartToStreaming(s, part)
-      resumeBuffer = []
-      streaming = s
-      resumeStreaming = false
-      resumeOpening = false
-      void flushStreaming(false)
+      for (const part of rs.buffer) applyPartToStreaming(sessionID, s, part)
+      rs.buffer = []
+      streaming.set(sessionID, s)
+      rs.active = false
+      rs.opening = false
+      void flushStreaming(sessionID, false)
     })()
   }
 
-  const streamingText = (): string => [...(streaming?.parts.values() ?? [])].join("\n").trim()
+  const streamingText = (sessionID: string): string => [...(streaming.get(sessionID)?.parts.values() ?? [])].join("\n").trim()
 
   /** OpenCode 风格活动时间线（最近 N 条：✓ 完成 / ⟳ 运行中 / ✗ 失败 / … 等待） */
-  const streamingTimeline = (target: Streaming | null = streaming): string => {
+  const streamingTimeline = (target: Streaming | null): string => {
     if (!target || target.tools.size === 0) return ""
     const entries = [...target.tools.values()].slice(-TIMELINE_MAX)
     return entries
@@ -203,33 +300,35 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       .join("\n")
   }
 
-  const flushStreaming = async (final: boolean, errText?: string): Promise<void> => {
-    if (!streaming || !transport) return
-    if (streaming.timer) {
-      clearTimeout(streaming.timer)
-      streaming.timer = null
+  const flushStreaming = async (sessionID: string, final: boolean, errText?: string): Promise<void> => {
+    const st = streaming.get(sessionID)
+    if (!st || !transport) return
+    if (st.timer) {
+      clearTimeout(st.timer)
+      st.timer = null
     }
-    streaming.lastFlush = Date.now()
-    const text = streamingText()
-    const timeline = streamingTimeline()
+    st.lastFlush = Date.now()
+    const text = streamingText(sessionID)
+    const timeline = streamingTimeline(st)
+    const queued = promptQueues.get(sessionID)?.length ?? 0
     const segments: string[] = []
     if (timeline) segments.push(timeline)
-    if (streaming.questionPending) segments.push("❓ 等待你的回答…")
-    if (promptQueue.length > 0) segments.push(`📥 排队 prompt：${promptQueue.length} 条`)
+    if (st.questionPending) segments.push("❓ 等待你的回答…")
+    if (queued > 0) segments.push(`📥 排队 prompt：${queued} 条`)
     if (text) segments.push(final ? text : `${cardTail(`${text} ▌`)} ▌`)
     if (segments.length === 0) {
-      segments.push(final ? "（无文本输出）" : streaming.reasoningActive ? "🤔 思考中…" : "正在处理…")
-    } else if (!final && text && streaming.reasoningActive) {
+      segments.push(final ? "（无文本输出）" : st.reasoningActive ? "🤔 思考中…" : "正在处理…")
+    } else if (!final && text && st.reasoningActive) {
       segments.push("🤔 思考中…")
     }
     const body = errText ?? segments.join("\n\n")
     try {
       if (errText) {
-        await transport.updateCard(streaming.messageID, renderStreamingCard("❌ 执行失败", cardTail(body), "red"))
+        await transport.updateCard(st.messageID, renderStreamingCard("❌ 执行失败", cardTail(body), "red"))
         return
       }
       if (!final) {
-        await transport.updateCard(streaming.messageID, renderStreamingCard("⏳ 正在处理", body, "blue"))
+        await transport.updateCard(st.messageID, renderStreamingCard("⏳ 正在处理", body, "blue"))
         return
       }
       // 成功定格：超长正文分页为多张卡（首卡原地更新，续页新增卡片），避免飞书单卡截断
@@ -237,7 +336,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       const total = chunks.length
       for (let i = 0; i < total; i++) {
         const card = renderStreamingCard(`✅ 任务完成${total > 1 ? ` (${i + 1}/${total})` : ""}`, chunks[i]!, "green")
-        if (i === 0) await transport.updateCard(streaming.messageID, card)
+        if (i === 0) await transport.updateCard(st.messageID, card)
         else await transport.sendCard(card)
       }
     } catch {
@@ -245,25 +344,58 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   }
 
-  const scheduleStreamingFlush = (): void => {
-    if (!streaming) return
+  const scheduleStreamingFlush = (sessionID: string): void => {
+    const st = streaming.get(sessionID)
+    if (!st) return
     const now = Date.now()
-    const due = streaming.lastFlush + STREAM_INTERVAL_MS
+    const due = st.lastFlush + STREAM_INTERVAL_MS
     if (now >= due) {
-      void flushStreaming(false)
+      void flushStreaming(sessionID, false)
       return
     }
-    if (!streaming.timer) {
-      streaming.timer = setTimeout(() => void flushStreaming(false), due - now)
+    if (!st.timer) {
+      st.timer = setTimeout(() => void flushStreaming(sessionID, false), due - now)
     }
   }
 
-  const closeStreaming = (): void => {
-    if (streaming?.timer) clearTimeout(streaming.timer)
-    streaming = null
+  const closeStreaming = (sessionID: string): void => {
+    const st = streaming.get(sessionID)
+    if (st?.timer) clearTimeout(st.timer)
+    streaming.delete(sessionID)
   }
 
-  const sharedSession = (): string | null => share.current?.sessionID ?? null
+  /** 单会话停止分享后清空其派生状态（流式卡/队列/续段/pending 审批与提问） */
+  const cleanupSessionState = (sessionID: string): void => {
+    busySessions.delete(sessionID)
+    promptQueues.delete(sessionID)
+    closeStreaming(sessionID)
+    resumeStates.delete(sessionID)
+    pendingParts.delete(sessionID)
+    for (const [id, props] of pendingPermissions) {
+      if ((props as { sessionID?: string }).sessionID === sessionID) {
+        pendingPermissions.delete(id)
+        const idx = permissionOrder.indexOf(id)
+        if (idx >= 0) permissionOrder.splice(idx, 1)
+      }
+    }
+    for (const [id, props] of pendingQuestions) {
+      if ((props as { sessionID?: string }).sessionID === sessionID) {
+        pendingQuestions.delete(id)
+        const idx = questionOrder.indexOf(id)
+        if (idx >= 0) questionOrder.splice(idx, 1)
+      }
+    }
+  }
+
+  /** 飞书指令的目标会话：优先按来源 chat 精确匹配（D6），多会话同 chat 时取 active */
+  const resolveTargetSession = (ctx: InboundContext): string | null => {
+    const inChat = share.list().filter((t) => t.chatID === ctx.chatID)
+    if (inChat.length > 0) {
+      const activeID = share.activeSessionID
+      return inChat.find((t) => t.sessionID === activeID)?.sessionID ?? inChat[0]!.sessionID
+    }
+    return share.activeSessionID
+  }
 
   const fetchMessages = async (sessionID: string, limit: number) => {
     const res = await api.client.session.messages({ sessionID, limit })
@@ -338,7 +470,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       `**消息数**：${messageCount}`,
       files.length > 0 ? `**文件变更**：${files.length} 个（+${addDel.a}/-${addDel.d}）` : null,
       todos.length > 0 ? `**待办**：${doneTodos}/${todos.length} 完成` : null,
-      promptQueue.length > 0 ? `**排队远程 prompt**：${promptQueue.length}` : null,
+      (promptQueues.get(sessionID)?.length ?? 0) > 0 ? `**排队远程 prompt**：${promptQueues.get(sessionID)?.length}` : null,
     ]
     return lines.filter(Boolean).join("\n")
   }
@@ -424,25 +556,26 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   /** 会话空闲后依次执行排队的远程 prompt */
   const drainPromptQueue = async (sessionID: string): Promise<void> => {
-    const chatID = share.current?.chatID ?? ""
-    while (promptQueue.length > 0) {
-      const text = promptQueue[0]!
+    const chatID = chatIDFor(sessionID)
+    const queue = queueOf(sessionID)
+    while (queue.length > 0) {
+      const text = queue[0]!
       try {
         await submitPrompt(sessionID, text)
       } catch (err) {
         if (/busy/i.test(String(err))) return // 又忙了，等下一个 idle
-        promptQueue.shift()
+        queue.shift()
         await emit({ kind: "task_failed", sessionID, chatID, error: `queued prompt: ${String(err)}` })
         continue
       }
-      promptQueue.shift()
+      queue.shift()
       return // 已启动一个回合，等它完成后的下一个 idle 继续
     }
   }
 
   // ---- 入站命令处理（飞书 → TUI） ----
   const sendRejected = async (chatID: string, reason: string): Promise<void> => {
-    await emit({ kind: "status", sessionID: sharedSession() ?? "", chatID, text: `rejected: ${reason}` })
+    await emit({ kind: "status", sessionID: share.activeSessionID ?? "", chatID, text: `rejected: ${reason}` })
   }
 
   /** 回答明细文本：Q 保留原问题、A 显示选择（问题原文缺失时只显示 A） */
@@ -460,7 +593,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const handleInbound = async (
     cmd: InboundCommand,
     ctx: InboundContext,
-    opts?: { silentStatus?: boolean },
+    opts?: { silentStatus?: boolean; targetSessionID?: string },
   ): Promise<void> => {
     const guard = security.checkInbound(ctx)
     if (!guard.ok) {
@@ -468,8 +601,26 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       await sendRejected(ctx.chatID, guard.reason)
       return
     }
-    const sessionID = sharedSession()
-    if (cmd.action !== "stop") {
+    // 审批/提问回复：requestID 跨实例归属——follower 发起的审批/提问必须转发回 follower
+    if (cmd.action === "permission_reply" || cmd.action === "question_reply") {
+      const order = cmd.action === "permission_reply" ? permissionOrder : questionOrder
+      const ownResolvable = cmd.requestID.startsWith("#")
+        ? resolveSelector(cmd.requestID, order) !== null
+        : (cmd.action === "permission_reply" ? pendingPermissions : pendingQuestions).has(cmd.requestID)
+      if (!ownResolvable && hub) {
+        const pid = hub.ownerOfRequest(cmd.requestID)
+        if (pid) {
+          security.audit({ direction: "in", action: cmd.action, ok: true, senderID: ctx.senderID, chatID: ctx.chatID, detail: `relay->pid ${pid}` })
+          hub.forwardCommand(pid, cmd, ctx)
+          return
+        }
+      }
+    }
+    // 多会话管理指令（列表/切换）作用于全局列表；断开指令在 case stop 内处理跨实例转发
+    const bypassSessionCheck = cmd.action === "stop" || cmd.action === "session_list" || cmd.action === "session_switch"
+    let sid = ""
+    if (!bypassSessionCheck) {
+      const sessionID = opts?.targetSessionID ?? resolveTargetSession(ctx)
       if (!sessionID) {
         security.audit({ direction: "in", action: cmd.action, ok: false, senderID: ctx.senderID, chatID: ctx.chatID, detail: "no shared session" })
         await sendRejected(ctx.chatID, "no shared session")
@@ -480,9 +631,16 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         await sendRejected(ctx.chatID, "session mismatch")
         return
       }
+      // external 会话（其他 TUI 进程的）：转发给属主
+      const pid = share.externalOwnerOf(sessionID)
+      if (pid) {
+        security.audit({ direction: "in", action: cmd.action, ok: true, senderID: ctx.senderID, chatID: ctx.chatID, detail: `relay->pid ${pid}` })
+        hub?.forwardCommand(pid, cmd, ctx, sessionID)
+        return
+      }
+      sid = sessionID
     }
     security.audit({ direction: "in", action: cmd.action, ok: true, senderID: ctx.senderID, chatID: ctx.chatID })
-    const sid = sessionID ?? ""
 
     // 兜底：命令处理抛出的任何异常都回一张错误卡 + 写调试日志，绝不静默失败
     //（此前 void handleInbound() 会吞掉 unhandled rejection，飞书侧表现为"没反应"）
@@ -499,7 +657,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     cmd: InboundCommand,
     ctx: InboundContext,
     sid: string,
-    opts?: { silentStatus?: boolean },
+    opts?: { silentStatus?: boolean; targetSessionID?: string },
   ): Promise<void> => {
     switch (cmd.action) {
       case "prompt": {
@@ -508,14 +666,15 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         const st = api.state.session.status(sid)?.type
         if (st === "busy" || st === "retry") {
           // 会话忙：进入插件自管队列（流式卡显示 📥 队列行），idle 后自动执行
-          promptQueue.push(text)
-          if (streaming) void flushStreaming(false)
+          const queue = queueOf(sid)
+          queue.push(text)
+          if (streaming.has(sid)) void flushStreaming(sid, false)
           else
             await emit({
               kind: "status",
               sessionID: sid,
               chatID: ctx.chatID,
-              text: `已加入队列（第 ${promptQueue.length} 条），当前任务结束后自动执行`,
+              text: `已加入队列（第 ${queue.length} 条），当前任务结束后自动执行`,
             })
           return
         }
@@ -525,14 +684,15 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         } catch (err) {
           const msg = String(err)
           if (/busy/i.test(msg)) {
-            promptQueue.push(text)
-            if (streaming) scheduleStreamingFlush()
+            const queue = queueOf(sid)
+            queue.push(text)
+            if (streaming.has(sid)) scheduleStreamingFlush(sid)
             else
               await emit({
                 kind: "status",
                 sessionID: sid,
                 chatID: ctx.chatID,
-                text: `会话转为忙碌，已加入队列（第 ${promptQueue.length} 条）`,
+                text: `会话转为忙碌，已加入队列（第 ${queue.length} 条）`,
               })
           } else {
             await emit({ kind: "task_failed", sessionID: sid, chatID: ctx.chatID, error: `prompt: ${msg}` })
@@ -680,7 +840,91 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         return
       }
       case "stop": {
-        stopSharing("remote stop")
+        if (cmd.scope === "all") {
+          // 全部断开：转发给所有 follower（它们自停自清），再停本进程全部
+          if (hub) {
+            for (const ownerID of new Set(hub.listSessions().map((s) => s.ownerID))) {
+              hub.forwardCommand(ownerID, { action: "stop", scope: "all" }, ctx)
+            }
+          }
+          stopSharing("remote stop", "all")
+          return
+        }
+        const target = opts?.targetSessionID ?? (sid || share.activeSessionID)
+        if (!target) {
+          stopSharing("remote stop", "active") // 无会话：保持 0.1.x 收尾行为
+          return
+        }
+        const pid = share.externalOwnerOf(target)
+        if (pid) {
+          // active 属于其他 TUI：定向转发（targetSessionID 防止 follower 停错自己的 active）
+          hub?.forwardCommand(pid, { action: "stop", scope: "active", targetSessionID: target }, ctx)
+          return
+        }
+        stopSharing("remote stop", "active", target)
+        return
+      }
+      case "session_list": {
+        if (share.count === 0) {
+          await emit({ kind: "status", sessionID: "", chatID: ctx.chatID, text: "当前没有已分享的会话（在 TUI 里 /feishu → Share current session）" })
+          return
+        }
+        await emit({ kind: "session_list", sessionID: share.activeSessionID ?? "", chatID: ctx.chatID, sessions: sessionListEntries() })
+        return
+      }
+      case "session_switch": {
+        const list = share.list()
+        const target = list[cmd.index - 1]
+        if (!target) {
+          await emit({
+            kind: "status",
+            sessionID: share.activeSessionID ?? "",
+            chatID: ctx.chatID,
+            text: `rejected: 会话序号 ${cmd.index} 不存在（先发 /session 查看列表，共 ${list.length} 个）`,
+          })
+          return
+        }
+        const previous = share.activeSessionID
+        if (previous === target.sessionID) {
+          const title = sessionListEntries().find((s) => s.sessionID === target.sessionID)?.title
+          await emit({ kind: "status", sessionID: target.sessionID, chatID: ctx.chatID, text: `当前已在该会话上（${title ?? target.sessionID}），无需切换` })
+          return
+        }
+        share.setActive(target.sessionID)
+        // D3 三段式：切换提醒（卡标题）+ 历史 summary + 最新一次交互
+        // 本进程会话：实时查询；external 会话：读属主同步过来的快照（跨进程拿不到对方服务端）
+        const extPID = share.externalOwnerOf(target.sessionID)
+        if (extPID !== undefined) {
+          const meta = hub?.followerSession(target.sessionID)
+          const snap = meta?.snapshot
+          await emit({
+            kind: "session_switched",
+            sessionID: target.sessionID,
+            chatID: ctx.chatID,
+            sessionTitle: meta?.title,
+            previousSessionID: previous ?? undefined,
+            statusText: snap?.statusText || "（属主尚未同步快照，稍后重试 /session <n>）",
+            messageCount: snap?.messageCount,
+            lastUserText: snap?.lastUserText,
+            lastAssistantText: snap?.lastAssistantText,
+          })
+          return
+        }
+        const [statusText, msgs] = await Promise.all([
+          buildStatusText(target.sessionID),
+          fetchMessages(target.sessionID, 20).catch(() => []),
+        ])
+        const summary = summarize(api.state.session.get(target.sessionID), msgs as never)
+        await emit({
+          kind: "session_switched",
+          sessionID: target.sessionID,
+          chatID: ctx.chatID,
+          previousSessionID: previous ?? undefined,
+          statusText,
+          messageCount: summary.messageCount,
+          lastUserText: summary.lastUserText,
+          lastAssistantText: summary.lastAssistantText,
+        })
         return
       }
     }
@@ -709,22 +953,75 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       api.ui.toast({ variant: "info", title: "feishu-share", message: `Already sharing ${sessionID}` })
       return
     }
-    try {
-      transport = createTransport(config, (level, msg) => {
-        if (level === "error") api.ui.toast({ variant: "error", title: "feishu-share", message: msg })
-      })
-      await transport.start()
-    } catch (err) {
-      share.stop()
-      transport = null
-      api.ui.toast({ variant: "error", title: "feishu-share", message: `transport start failed: ${String(err)}` })
-      return
+    if (!transport) {
+      // 角色选举：锁空闲 → leader（直连飞书）；被其他存活实例持有 → follower（本地中继）
+      const lock = acquireTransportLock(config, instanceID)
+      if (lock.ok) {
+        releaseTransportLock = lock.release
+        try {
+          transport = createTransport(config, (level, msg) => {
+            if (level === "error") api.ui.toast({ variant: "error", title: "feishu-share", message: msg })
+          })
+          await transport.start()
+        } catch (err) {
+          share.stopOne(sessionID)
+          transport = null
+          releaseTransportLock()
+          releaseTransportLock = null
+          api.ui.toast({ variant: "error", title: "feishu-share", message: `transport start failed: ${String(err)}` })
+          return
+        }
+        startLeaderHub()
+      } else {
+        followerMode = true
+        const relay = new RelayTransport(config, instanceID, {
+          onPromote: (release) => promoteFollowerToLeader(release),
+        })
+        try {
+          await relay.start()
+        } catch (err) {
+          followerMode = false
+          share.stopOne(sessionID)
+          api.ui.toast({ variant: "error", title: "feishu-share", message: `relay start failed: ${String(err)}` })
+          return
+        }
+        transport = relay
+        relay.onLeaderExit((reason) => {
+          // leader 优雅退出：接管连接（升为 leader）；接管失败则本会话分享失效
+          dbg(`leader exit (${reason}) -> promote`)
+          promoteFollowerToLeader(() => {})
+        })
+      }
+      wireTransport(transport)
     }
-    transport.onInbound((cmd, ctx) => {
-      void handleInbound(cmd, ctx)
+    // 通知飞书：新会话自己的开启卡 + 多会话时的全局提醒卡（不打断当前 active）
+    if (followerMode) await publishFollowerMeta()
+    await emit({ kind: "share_open", sessionID, chatID, session: await buildSnapshot(sessionID) })
+    if (share.count > 1) {
+      await emit({
+        kind: "multi_session_new",
+        sessionID,
+        chatID,
+        sessions: sessionListEntries(),
+        newIndex: share.indexOf(sessionID),
+      })
+    }
+    api.ui.toast({ variant: "success", title: "feishu-share", message: `Sharing ${sessionID} -> ${chatID}` })
+  }
+
+  /** 给任意 transport 挂上入站处理（leader 直连与 follower 接管共用） */
+  const wireTransport = (t: NonNullable<typeof transport>): void => {
+    t.onInbound((cmd, ctx, inboundOpts) => {
+      void handleInbound(cmd, ctx, inboundOpts)
     })
-    // 卡片按钮点击：走与文本指令相同的安全/路由路径，处理后把原卡片置为已处理状态
-    transport.onCardAction((value, ctx, messageID) => {
+    t.onCardAction((value, ctx, messageID) => {
+      // follower 的卡片：转发回属主 TUI 处理（按钮 value 只作路由，白名单在 follower 侧）
+      const pid = messageID ? hub?.ownerOfMessageID(messageID) : undefined
+      if (pid) {
+        security.audit({ direction: "in", action: "card_action->relay", ok: true, senderID: ctx.senderID, chatID: ctx.chatID, detail: `pid ${pid}` })
+        hub?.forwardCardAction(pid, value, ctx, messageID)
+        return
+      }
       const cmd = cardActionToCommand(value)
       if (!cmd) return
       // question_custom 的引导卡由传输层同步返回，无需异步处理
@@ -737,7 +1034,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
           : []
       // 卡片按钮作答：定格旧流式卡（回复将开新卡展示，不再重复回答内容）
       if (cmd.action === "question_reply") {
-        onQuestionResolved("card-action", cmd.requestID)
+        const entry = pendingQuestions.get(cmd.requestID) as { sessionID?: string } | undefined
+        onQuestionResolved("card-action", cmd.requestID, entry?.sessionID)
       }
       void (async () => {
         await handleInbound(cmd, ctx, { silentStatus: true })
@@ -754,36 +1052,123 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         }
       })()
     })
-    await emit({ kind: "share_open", sessionID, chatID, session: await buildSnapshot(sessionID) })
-    api.ui.toast({ variant: "success", title: "feishu-share", message: `Sharing ${sessionID} -> ${chatID}` })
   }
 
-  const stopSharing = (reason: string): void => {
-    const was = share.current
-    share.stop()
-    busySessions = new Set()
-    pendingPermissions.clear()
-    pendingQuestions.clear()
-    permissionOrder.length = 0
-    questionOrder.length = 0
-    promptQueue.length = 0
-    closeStreaming()
+  /** 启动 leader 侧中继枢纽：扫描 follower、泵卡片、收编 external 会话 */
+  const startLeaderHub = (): void => {
+    if (hub || !transport) return
+    hub = new LeaderHub(config.stateDir, instanceID, transport, {
+      onSessionsAdded: (sessions, ownerID) => {
+        for (const s of sessions) {
+          share.addExternal(s.sessionID, s.chatID, ownerID, s.pid)
+          security.audit({ direction: "in", action: "follower_join", ok: true, detail: `owner ${ownerID} session ${s.sessionID}` })
+        }
+        // 后接入的会话不抢占 active（需求 3/5）：发全局提醒卡
+        const last = sessions[sessions.length - 1]!
+        if (share.count > 1) {
+          void emit({
+            kind: "multi_session_new",
+            sessionID: last.sessionID,
+            chatID: last.chatID,
+            sessions: sessionListEntries(),
+            newIndex: share.indexOf(last.sessionID),
+          })
+        }
+        api.ui.toast({ variant: "info", title: "feishu-share", message: `Follower session joined (owner ${ownerID})` })
+      },
+      onSessionsRemoved: (sessions) => {
+        for (const s of sessions) share.removeExternal(s.sessionID)
+      },
+      dbg,
+    })
+    hub.start()
+  }
+
+  /** follower 接管：锁已到手，换真 transport + 起 hub，收编其余 follower */
+  const promoteFollowerToLeader = (release: () => void): void => {
+    if (!followerMode) return
+    followerMode = false
+    releaseTransportLock = release
+    void (async () => {
+      try {
+        const real = createTransport(config, (level, msg) => {
+          if (level === "error") api.ui.toast({ variant: "error", title: "feishu-share", message: msg })
+        })
+        await real.start()
+        transport = real
+        startLeaderHub()
+        wireTransport(real)
+        api.ui.toast({ variant: "success", title: "feishu-share", message: "已接管飞书连接（升为 leader）" })
+        await publishFollowerMeta().catch(() => {})
+      } catch (err) {
+        api.ui.toast({ variant: "error", title: "feishu-share", message: `接管飞书连接失败: ${String(err)}` })
+      }
+    })()
+  }
+
+  /**
+   * 停止分享。scope=active（默认）只停当前 active 会话；scope=all 全部停止。
+   * targetSessionID 可定向停某个本进程会话（跨实例转发用，绕过 active 语义）。
+   * 多会话下单个停止不关 transport（WS 常驻），最后一个停止/无会话残留时才收尾关闭。
+   */
+  const stopSharing = (reason: string, scope: "active" | "all" = "active", targetSessionID?: string): void => {
+    const stopped: Array<{ sessionID: string; chatID: string }> = []
+    if (scope === "all") {
+      // 只停本进程会话；external 会话由调用方负责转发（各 TUI 自停自清）
+      for (const t of share.list().filter((x) => !share.externalOwnerOf(x.sessionID))) {
+        stopped.push({ sessionID: t.sessionID, chatID: t.chatID })
+      }
+      share.stopAll()
+    } else {
+      const cur = targetSessionID ? share.targetOf(targetSessionID) : share.current
+      if (targetSessionID && share.externalOwnerOf(targetSessionID) !== undefined) {
+        api.ui.toast({ variant: "error", title: "feishu-share", message: "refusing to stop a relayed session owned by another TUI" })
+        return
+      }
+      if (cur) {
+        share.stopOne(cur.sessionID)
+        stopped.push({ sessionID: cur.sessionID, chatID: cur.chatID })
+      }
+    }
+    for (const t of stopped) cleanupSessionState(t.sessionID)
     // TUI 会话内留一条持久通知（像普通对话消息一样显示、不消失；noReply 不触发 agent 回复）
-    if (was && reason !== "tui exit") {
+    if (reason !== "tui exit") {
       const reasonText = reason === "remote stop" ? "远程 /disconnect" : reason === "menu" ? "TUI 菜单停止" : reason
-      const text = `⏸️ 飞书分享已断开（${reasonText}），本地任务不受影响`
-      recentInjected.set(text, Date.now())
-      void api.client.session
-        .prompt({ sessionID: was.sessionID, parts: [{ type: "text", text }], noReply: true })
-        .catch(() => {})
+      for (const t of stopped) {
+        const text = `⏸️ 飞书分享已断开（${reasonText}），本地任务不受影响`
+        recentInjected.set(text, Date.now())
+        void api.client.session
+          .prompt({ sessionID: t.sessionID, parts: [{ type: "text", text }], noReply: true })
+          .catch(() => {})
+      }
     }
     const t = transport
-    transport = null
-    if (t) {
-      void t
-        .send({ kind: "share_close", sessionID: was?.sessionID ?? "", chatID: was?.chatID ?? "", reason })
-        .then(() => t.stop())
-        .catch(() => {})
+    if (share.count === 0 && t) {
+      // 最后一个会话停止：逐个发 share_close 后收尾关闭 transport 并释放实例锁
+      transport = null
+      void (async () => {
+        for (const target of stopped) {
+          try {
+            await t.send({ kind: "share_close", sessionID: target.sessionID, chatID: target.chatID, reason })
+          } catch {
+            // 关闭路径忽略发送失败
+          }
+        }
+        await t.stop().catch(() => {})
+        releaseTransportLock?.()
+        releaseTransportLock = null
+      })()
+    } else if (t && stopped.length > 0) {
+      // 仍有剩余会话：只通知被停会话，transport 保持
+      void (async () => {
+        for (const target of stopped) {
+          try {
+            await t.send({ kind: "share_close", sessionID: target.sessionID, chatID: target.chatID, reason })
+          } catch {
+            // 忽略
+          }
+        }
+      })()
     }
     api.ui.toast({ variant: "warning", title: "feishu-share", message: `Sharing stopped (${reason})` })
   }
@@ -792,19 +1177,21 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
   api.event.on("session.status", (e) => {
     const { sessionID, status } = e.properties
     if (!share.isShared(sessionID)) return
-    const chatID = share.current?.chatID ?? "mock"
-    dbg(`status ${status.type} session=${sessionID.slice(0, 12)} busy=${busySessions.has(sessionID)} streaming=${streaming ? streaming.messageID.slice(0, 12) : "null"} resume=${resumeStreaming}`)
+    const chatID = chatIDFor(sessionID)
+    dbg(`status ${status.type} session=${sessionID.slice(0, 12)} busy=${busySessions.has(sessionID)} streaming=${streaming.has(sessionID) ? streaming.get(sessionID)!.messageID.slice(0, 12) : "null"} resume=${resumeStates.get(sessionID)?.active ?? false}`)
     if (status.type === "busy") {
       if (busySessions.has(sessionID)) return
       busySessions.add(sessionID)
-      closeStreaming()
-      resumeStreaming = false
-      resumeBuffer = []
-      resumeOpening = false
+      closeStreaming(sessionID)
+      const rs = resumeStateOf(sessionID)
+      rs.active = false
+      rs.buffer = []
+      rs.opening = false
+      pendingParts.set(sessionID, [])
       void (async () => {
         const messageID = await emit({ kind: "task_started", sessionID, chatID })
         if (messageID)
-          streaming = {
+          streaming.set(sessionID, {
             messageID,
             parts: new Map(),
             textPartIDs: new Set(),
@@ -813,7 +1200,12 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
             tools: new Map(),
             lastFlush: Date.now(),
             timer: null,
-          }
+          })
+        // 卡就绪：回放延迟窗口内的 parts（中继/WS 延迟不丢正文）
+        const buffered = pendingParts.get(sessionID) ?? []
+        pendingParts.delete(sessionID)
+        const st2 = streaming.get(sessionID)
+        if (st2) for (const part of buffered) applyPartToStreaming(sessionID, st2, part)
       })()
       return
     }
@@ -821,13 +1213,14 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       // 模型限流等可重试错误：反馈到飞书（流式卡原地提示，否则发一次性通知）
       const attempt = (status as { attempt?: number }).attempt ?? 0
       const message = String((status as { message?: string }).message ?? "rate limited")
-      if (streaming && transport) {
-      void (async () => {
-        if (!streaming || !transport) return
-        const body = `${cardTail(streamingText())}\n\n⚠️ ${message}（第 ${attempt} 次重试）`
+      const st = streaming.get(sessionID)
+      if (st && transport) {
+        void (async () => {
+          if (!transport) return
+          const body = `${cardTail(streamingText(sessionID))}\n\n⚠️ ${message}（第 ${attempt} 次重试）`
           try {
-            await transport.updateCard(streaming.messageID, renderStreamingCard("⏳ 模型限流，自动重试中", body, "orange"))
-            streaming.lastFlush = Date.now()
+            await transport.updateCard(st.messageID, renderStreamingCard("⏳ 模型限流，自动重试中", body, "orange"))
+            st.lastFlush = Date.now()
           } catch {
             // 忽略
           }
@@ -842,15 +1235,18 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (status.type === "idle") {
       if (!busySessions.has(sessionID)) return
       busySessions.delete(sessionID)
-      resumeStreaming = false
-      resumeBuffer = []
-      resumeOpening = false
-      if (streaming) {
+      const rs = resumeStateOf(sessionID)
+      rs.active = false
+      rs.buffer = []
+      rs.opening = false
+      const st = streaming.get(sessionID)
+      if (st) {
         // 流式卡定稿（承担 task_completed 通知，避免重复消息）
         void (async () => {
-          await flushStreaming(true)
-          closeStreaming()
-          if (promptQueue.length > 0) await drainPromptQueue(sessionID)
+          await flushStreaming(sessionID, true)
+          closeStreaming(sessionID)
+          if (followerMode) await publishFollowerMeta().catch(() => {})
+          if ((promptQueues.get(sessionID)?.length ?? 0) > 0) await drainPromptQueue(sessionID)
         })()
         return
       }
@@ -858,7 +1254,8 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         .then((msgs) => emit({ kind: "task_completed", sessionID, chatID, summary: lastAssistantText(msgs as never) }))
         .catch(() => emit({ kind: "task_completed", sessionID, chatID }))
         .finally(() => {
-          if (promptQueue.length > 0) void drainPromptQueue(sessionID)
+          if (followerMode) void publishFollowerMeta().catch(() => {})
+          if ((promptQueues.get(sessionID)?.length ?? 0) > 0) void drainPromptQueue(sessionID)
         })
     }
   })
@@ -877,7 +1274,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       state?: { status?: string; title?: string }
     }
     if (!p?.id) return
-    dbg(`part type=${p.type} tool=${p.tool ?? "-"} st=${p.state?.status ?? "-"} msg=${p.messageID?.slice(0, 12) ?? "-"} userMsg=${p.messageID ? userMessageIDs.has(p.messageID) : "-"} streaming=${streaming ? "y" : "n"} resume=${resumeStreaming} busy=${busySessions.has(sessionID)}`)
+    dbg(`part type=${p.type} tool=${p.tool ?? "-"} st=${p.state?.status ?? "-"} msg=${p.messageID?.slice(0, 12) ?? "-"} userMsg=${p.messageID ? userMessageIDs.has(p.messageID) : "-"} streaming=${streaming.has(sessionID) ? "y" : "n"} resume=${resumeStates.get(sessionID)?.active ?? false} busy=${busySessions.has(sessionID)}`)
     // 用户消息的文本 part：镜像到飞书（TUI 本地输入同步），不进流式卡正文
     if (p.messageID && userMessageIDs.has(p.messageID)) {
       if (
@@ -898,28 +1295,37 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         if (injectedAt && Date.now() - injectedAt < 60_000) {
           recentInjected.delete(text) // 飞书注入的 prompt 回声，跳过
         } else {
-          void emit({ kind: "tui_input", sessionID, chatID: share.current?.chatID ?? "mock", text: text.slice(0, 1000) })
+          void emit({ kind: "tui_input", sessionID, chatID: chatIDFor(sessionID), text: text.slice(0, 1000) })
         }
       }
       return
     }
     if (!share.isShared(sessionID)) return
-    if (!streaming) {
+    const st = streaming.get(sessionID)
+    if (!st) {
+      // busy 但流式卡未就绪（task_started 还在路上）：先缓冲，卡就绪后回放
+      if (busySessions.has(sessionID) && (p.type === "text" || p.type === "tool" || p.type === "reasoning")) {
+        const buf = pendingParts.get(sessionID) ?? []
+        buf.push(p)
+        pendingParts.set(sessionID, buf)
+        return
+      }
       // 提问回答后 agent 继续产出：为后续回复开一张新流式卡（旧卡已定格在上方）
-      if (resumeStreaming && busySessions.has(sessionID) && (p.type === "text" || p.type === "tool" || p.type === "reasoning")) {
-        resumeBuffer.push(p)
-        if (!resumeOpening) openResumeCard(sessionID)
+      const rs = resumeStateOf(sessionID)
+      if (rs.active && busySessions.has(sessionID) && (p.type === "text" || p.type === "tool" || p.type === "reasoning")) {
+        rs.buffer.push(p)
+        if (!rs.opening) openResumeCard(sessionID)
       }
       return
     }
     // 提问刚被回答：TUI 事件总线不发 question.replied（API 应答不触发），
     // 以 question 工具 part 状态变 completed/error 为准 → 定格旧卡，后续回复开新卡
-    if (p.type === "tool" && p.tool === "question" && streaming.questionPending && (p.state?.status === "completed" || p.state?.status === "error")) {
-      streaming.questionPending = false
-      onQuestionResolved("tool-part", p.id ?? "-")
+    if (p.type === "tool" && p.tool === "question" && st.questionPending && (p.state?.status === "completed" || p.state?.status === "error")) {
+      st.questionPending = false
+      onQuestionResolved("tool-part", p.id ?? "-", sessionID)
       return
     }
-    applyPartToStreaming(streaming, p)
+    applyPartToStreaming(sessionID, st, p)
   })
 
   // TUI 用户消息跟踪：为镜像本地输入识别用户消息（仅共享会话）
@@ -941,18 +1347,19 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     busySessions.delete(sessionID)
     const err = e.properties.error as { message?: string } | undefined
     const errMsg = String(err?.message ?? "unknown")
-    if (streaming) {
+    const st = streaming.get(sessionID)
+    if (st) {
       // 流式卡原地变红
       void (async () => {
-        await flushStreaming(true, errMsg)
-        closeStreaming()
+        await flushStreaming(sessionID, true, errMsg)
+        closeStreaming(sessionID)
       })()
       return
     }
     void emit({
       kind: "task_failed",
       sessionID,
-      chatID: share.current?.chatID ?? "mock",
+      chatID: chatIDFor(sessionID),
       error: errMsg,
     })
   })
@@ -983,7 +1390,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     void emit({
       kind: "permission_requested",
       sessionID,
-      chatID: share.current?.chatID ?? "",
+      chatID: chatIDFor(sessionID),
       requestID: id,
       permission,
       patterns: Array.isArray(patterns) ? patterns.map(String) : undefined,
@@ -1008,7 +1415,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     void emit({
       kind: "status",
       sessionID,
-      chatID: share.current?.chatID ?? "mock",
+      chatID: chatIDFor(sessionID),
       text: `🔀 已切换 Agent → **${agent}**（对后续对话生效）`,
     })
   })
@@ -1019,7 +1426,7 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     void emit({
       kind: "status",
       sessionID,
-      chatID: share.current?.chatID ?? "mock",
+      chatID: chatIDFor(sessionID),
       text: `🔀 已切换模型 → **${model.providerID}/${model.id}**（对后续对话生效）`,
     })
   })
@@ -1029,44 +1436,46 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
     if (!share.isShared(sessionID)) return
     if (!pendingQuestions.has(id)) questionOrder.push(id)
     pendingQuestions.set(id, e.properties)
-    void emit({ kind: "question_asked", sessionID, chatID: share.current?.chatID ?? "", requestID: id, questions })
+    void emit({ kind: "question_asked", sessionID, chatID: chatIDFor(sessionID), requestID: id, questions })
   })
   /** 提问已解决（回答/拒绝）：定格旧流式卡，agent 继续产出时开新卡展示回复 */
-  const onQuestionResolved = (source: string, requestID: string): void => {
-    dbg(`question.${source} id=${requestID} streaming=${streaming ? streaming.messageID.slice(0, 12) : "null"} resume -> true`)
-    if (streaming) {
-      streaming.questionPending = false
-      const prev = streaming
-      const segments = [streamingTimeline(prev), "✅ 已收到你的回答，继续处理中…", cardTail([...prev.parts.values()].join("\n").trim())]
-      closeStreaming()
-      resumeStreaming = true
-      resumeBuffer = []
-      resumeOpening = false
+  const onQuestionResolved = (source: string, requestID: string, sessionID?: string): void => {
+    const sid = sessionID ?? (pendingQuestions.get(requestID) as { sessionID?: string } | undefined)?.sessionID
+    dbg(`question.${source} id=${requestID} session=${sid?.slice(0, 12) ?? "?"} streaming=${sid && streaming.has(sid) ? streaming.get(sid)!.messageID.slice(0, 12) : "null"} resume -> true`)
+    if (!sid) return
+    const st = streaming.get(sid)
+    const rs = resumeStateOf(sid)
+    rs.active = true
+    rs.buffer = []
+    rs.opening = false
+    if (st) {
+      st.questionPending = false
+      const segments = [streamingTimeline(st), "✅ 已收到你的回答，继续处理中…", cardTail([...st.parts.values()].join("\n").trim())]
+      closeStreaming(sid)
       void transport
-        ?.updateCard(prev.messageID, renderStreamingCard("⏳ 已收到回答，继续处理…", segments.filter(Boolean).join("\n\n"), "blue"))
+        ?.updateCard(st.messageID, renderStreamingCard("⏳ 已收到回答，继续处理…", segments.filter(Boolean).join("\n\n"), "blue"))
         .catch(() => {})
       return
     }
-    resumeStreaming = true
-    resumeBuffer = []
-    resumeOpening = false
   }
 
   api.event.on("question.replied", (e) => {
     const requestID = e.properties.requestID
-    if (!pendingQuestions.has(requestID)) return
+    const entry = pendingQuestions.get(requestID) as { sessionID?: string } | undefined
+    if (!entry) return
     pendingQuestions.delete(requestID)
     const idx = questionOrder.indexOf(requestID)
     if (idx >= 0) questionOrder.splice(idx, 1)
-    onQuestionResolved("replied", requestID)
+    onQuestionResolved("replied", requestID, entry.sessionID)
   })
   api.event.on("question.rejected", (e) => {
     const requestID = e.properties.requestID
-    if (!pendingQuestions.has(requestID)) return
+    const entry = pendingQuestions.get(requestID) as { sessionID?: string } | undefined
+    if (!entry) return
     pendingQuestions.delete(requestID)
     const idx = questionOrder.indexOf(requestID)
     if (idx >= 0) questionOrder.splice(idx, 1)
-    onQuestionResolved("rejected", requestID)
+    onQuestionResolved("rejected", requestID, entry.sessionID)
   })
 
   // ---- /feishu 命令与交互菜单 ----
@@ -1083,12 +1492,12 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
       {
         title: "Stop sharing",
         value: "stop",
-        description: "Unbind remote access (keeps local task running)",
+        description: share.count > 1 ? "Stop sharing the active session (keeps others)" : "Unbind remote access (keeps local task running)",
       },
       {
         title: "Show share status",
         value: "status",
-        description: current ? `shared: ${current.sessionID} -> ${current.chatID}` : "unshared",
+        description: current ? `shared: ${share.count} session(s), active ${current.sessionID} -> ${current.chatID}` : "unshared",
       },
       {
         title: "PoC: send test prompt",
@@ -1116,14 +1525,21 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
         await startSharing()
         return
       case "stop":
-        stopSharing("menu")
+        {
+          // TUI 菜单停止：仅停本进程会话；active 属于其他 TUI 时提示去对应端操作
+          if (share.current === null && share.activeSessionID) {
+            api.ui.toast({ variant: "info", title: "feishu-share", message: "当前飞书活动会话属于另一个 TUI；请在飞书端 /disconnect 或到对应 TUI 停止" })
+            return
+          }
+          stopSharing("menu")
+        }
         return
       case "status": {
         const s = share.current
         api.ui.toast({
           variant: "info",
           title: "feishu-share",
-          message: s ? `shared: ${s.sessionID} -> ${s.chatID}` : "unshared",
+          message: s ? `shared: ${share.count} session(s), active ${s.sessionID} -> ${s.chatID}` : "unshared",
         })
         if (s) await emit({ kind: "status", sessionID: s.sessionID, chatID: s.chatID, text: await buildStatusText(s.sessionID) })
         return
@@ -1157,10 +1573,20 @@ export const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   // ---- 生命周期清理 ----
   api.lifecycle.onDispose(() => {
-    if (share.current) stopSharing("tui exit")
+    if (share.count > 0) stopSharing("tui exit", "all")
     const t = transport
     transport = null
-    return t?.stop() ?? Promise.resolve()
+    // leader 优雅退出：通知 follower 接管（它们抢锁，一个升 leader），再关自己的连接
+    if (hub) {
+      hub.notifyLeaderExit("tui exit")
+      hub.stop()
+      hub = null
+    }
+    const done = t?.stop() ?? Promise.resolve()
+    return Promise.resolve(done).finally(() => {
+      releaseTransportLock?.()
+      releaseTransportLock = null
+    })
   })
 }
 

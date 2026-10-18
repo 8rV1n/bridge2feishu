@@ -444,3 +444,141 @@ test("renderer: table with header only (streaming) degrades to markdown; oversiz
   assert.ok(cards[0]!.body.elements.every((e) => e.tag === "markdown"))
   assert.ok(JSON.stringify(cards[0]!.body).includes("```text"))
 })
+
+// ---------- 多 session 卡片（0.2.0） ----------
+
+test("renderer: multi_session_new card lists sessions with star and switch button", () => {
+  const cards = renderCardMulti({
+    kind: "multi_session_new",
+    sessionID: "s2",
+    chatID: "c",
+    newIndex: 2,
+    sessions: [
+      { sessionID: "s1", title: "Alpha", active: true },
+      { sessionID: "s2", title: "Beta", active: false },
+    ],
+  })
+  assert.equal(cards.length, 1)
+  assert.ok(cards[0]!.header.title.content.includes("新会话已接入"))
+  const body = JSON.stringify(cards[0]!.body)
+  assert.ok(body.includes("★"), "active session must be starred")
+  assert.ok(body.includes("Alpha") && body.includes("Beta"))
+  assert.ok(body.includes("/session <n>"), "must hint the switch command")
+  const btn = cards[0]!.body.elements.find((e) => e.tag === "button") as { behaviors?: Array<{ value?: { kind?: string; index?: number } }> }
+  assert.equal(btn.behaviors?.[0]?.value?.kind, "session_switch", "button value must be whitelisted session_switch")
+  assert.equal(btn.behaviors?.[0]?.value?.index, 2)
+})
+
+test("renderer: session_list card numbers sessions in share order with active star", () => {
+  const cards = renderCardMulti({
+    kind: "session_list",
+    sessionID: "s2",
+    chatID: "c",
+    sessions: [
+      { sessionID: "s1", title: "Alpha", active: false },
+      { sessionID: "s2", title: "Beta", active: true },
+    ],
+  })
+  const body = JSON.stringify(cards[0]!.body)
+  assert.ok(body.includes("**1.** Alpha"))
+  assert.ok(body.includes("**2.** ★ **Beta**"), "active entry carries the star")
+})
+
+test("renderer: session_switched card = reminder title + summary + last interaction (D3 three sections)", () => {
+  const cards = renderCardMulti({
+    kind: "session_switched",
+    sessionID: "s2",
+    chatID: "c",
+    sessionTitle: "Beta Session",
+    previousSessionID: "s1",
+    statusText: "**模型**：p/m\n**消息数**：3",
+    messageCount: 3,
+    lastUserText: "上一轮的问题",
+    lastAssistantText: "上一轮的回答",
+  })
+  assert.ok(cards[0]!.header.title.content.includes("已切换到会话：Beta Session"), "title is the explicit reminder")
+  const body = JSON.stringify(cards[0]!.body)
+  assert.ok(body.includes("会话概览"), "body should contain the summary section")
+  assert.ok(body.includes("上一轮的问题"), "body should contain last user text")
+  assert.ok(body.includes("上一轮的回答"), "body should contain last assistant text")
+  // 缺失交互时显示占位
+  const empty = renderCardMulti({
+    kind: "session_switched",
+    sessionID: "s2",
+    chatID: "c",
+    statusText: "-",
+  })
+  const emptyBody = JSON.stringify(empty[0]!.body)
+  assert.ok(emptyBody.includes("（无）"))
+})
+
+test("renderer: (后台) session title tag marks background sessions", () => {
+  const cards = renderCardMulti({
+    kind: "task_started",
+    sessionID: "s2",
+    chatID: "c",
+    sessionTitle: "（后台）Beta Session",
+  })
+  assert.ok(cards[0]!.header.title.content.includes("（后台）Beta Session"))
+})
+
+test("router: /session list and switch; /disconnect all", () => {
+  assert.deepEqual(parseFeishuCommand("/session"), { action: "session_list" })
+  assert.deepEqual(parseFeishuCommand("/session 2"), { action: "session_switch", index: 2 })
+  assert.equal(parseFeishuCommand("/session abc"), null)
+  assert.deepEqual(parseFeishuCommand("/disconnect all"), { action: "stop", scope: "all" })
+})
+
+test("router: cardActionToCommand maps session_switch button value", () => {
+  assert.deepEqual(cardActionToCommand({ kind: "session_switch", index: 3 }), { action: "session_switch", index: 3 })
+  assert.equal(cardActionToCommand({ kind: "session_switch", index: 0 }), null)
+  assert.equal(cardActionToCommand({ kind: "session_switch" }), null)
+})
+
+test("renderer: session_list card has one-click buttons for <=4 sessions", () => {
+  const cards = renderCardMulti({
+    kind: "session_list",
+    sessionID: "s2",
+    chatID: "c",
+    sessions: [
+      { sessionID: "s1", title: "Alpha", active: true },
+      { sessionID: "s2", title: "Beta", active: false },
+    ],
+  })
+  const buttons = cards[0]!.body.elements.filter((e) => e.tag === "button") as Array<{
+    text: { content: string }
+    behaviors: Array<{ value?: { kind?: string; index?: number } }>
+  }>
+  assert.equal(buttons.length, 2)
+  assert.equal(buttons[0]!.text.content, "★ 1. Alpha")
+  assert.equal(buttons[0]!.type, "default", "active session button is not highlighted")
+  assert.equal(buttons[1]!.text.content, "2. Beta")
+  assert.equal(buttons[1]!.behaviors[0]!.value?.kind, "session_switch")
+  assert.equal(buttons[1]!.behaviors[0]!.value?.index, 2)
+})
+
+test("renderer: session_list card falls back to dropdown form for >4 sessions", () => {
+  const sessions = Array.from({ length: 6 }, (_, i) => ({
+    sessionID: `s${i + 1}`,
+    title: `Session ${i + 1}`,
+    active: i === 2,
+  }))
+  const cards = renderCardMulti({ kind: "session_list", sessionID: "s3", chatID: "c", sessions })
+  const form = cards[0]!.body.elements.find((e) => e.tag === "form") as
+    | { name: string; elements: Array<{ tag: string; name?: string; options?: Array<{ text: { content: string }; value: string }>; value?: unknown }> }
+    | undefined
+  assert.ok(form, "dropdown form should be used for many sessions")
+  const select = form.elements.find((e) => e.tag === "select_static")
+  assert.ok(select)
+  assert.equal(select.options?.length, 6)
+  assert.ok(select.options?.[2]?.text.content.includes("★"), "active entry starred in dropdown")
+  assert.equal(select.options?.[2]?.value, "3")
+  const submit = form.elements.find((e) => e.tag === "button")
+  assert.equal(submit?.value && (submit.value as { kind?: string }).kind, "session_switch")
+})
+
+test("router: session_switch dropdown form submission parses form.session_index", () => {
+  assert.deepEqual(cardActionToCommand({ kind: "session_switch", form: { session_index: "2" } }), { action: "session_switch", index: 2 })
+  assert.equal(cardActionToCommand({ kind: "session_switch", form: { session_index: "0" } }), null)
+  assert.equal(cardActionToCommand({ kind: "session_switch", form: {} }), null)
+})

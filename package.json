@@ -1,6 +1,6 @@
 {
   "name": "opencode-feishu-share",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode native TUI plugin: share the current session to Feishu with bidirectional interaction (WebSocket long connection, no public port).",
   "type": "module",
   "license": "MIT",

@@ -10,18 +10,20 @@ import { join } from "node:path"
 import { loadConfig } from "../dist/config.js"
 import type { InboundCommand } from "../dist/types.js"
 
-// ---------- ShareStateManager ----------
+// ---------- ShareStateManager（多 session 语义） ----------
 
 test("share state: default unshared", () => {
   const s = new ShareStateManager()
   assert.equal(s.status, "unshared")
   assert.equal(s.current, null)
+  assert.equal(s.count, 0)
 })
 
-test("share state: share binds session and chat", () => {
+test("share state: first share becomes active", () => {
   const s = new ShareStateManager()
   const r = s.share("ses_a", "chat_1")
   assert.equal(r.ok, true)
+  assert.equal((r as { isActive: boolean }).isActive, true)
   assert.equal(s.status, "shared")
   assert.equal(s.current?.sessionID, "ses_a")
   assert.equal(s.isShared("ses_a"), true)
@@ -34,32 +36,70 @@ test("share state: duplicate share of same target is idempotent", () => {
   const r = s.share("ses_a", "chat_1")
   assert.equal(r.ok, true)
   assert.equal((r as { already: boolean }).already, true)
+  assert.equal((r as { isActive: boolean }).isActive, true)
+  assert.equal(s.count, 1)
 })
 
-test("share state: cannot share a second session while sharing", () => {
+test("share state: second share does not steal active", () => {
   const s = new ShareStateManager()
   s.share("ses_a", "chat_1")
   const r = s.share("ses_b", "chat_1")
-  assert.equal(r.ok, false)
-  assert.equal(s.current?.sessionID, "ses_a")
+  assert.equal(r.ok, true)
+  assert.equal((r as { isActive: boolean }).isActive, false)
+  assert.equal(s.current?.sessionID, "ses_a", "active must stay on first shared session")
+  assert.equal(s.count, 2)
+  assert.deepEqual(s.list().map((t) => t.sessionID), ["ses_a", "ses_b"], "list keeps share order")
+  assert.equal(s.indexOf("ses_b"), 2)
 })
 
-test("share state: stop unbinds and keeps nothing shared", () => {
+test("share state: setActive switches active among shared sessions", () => {
   const s = new ShareStateManager()
   s.share("ses_a", "chat_1")
-  const r = s.stop()
+  s.share("ses_b", "chat_1")
+  assert.equal(s.setActive("ses_b"), true)
+  assert.equal(s.current?.sessionID, "ses_b")
+  assert.equal(s.setActive("ses_unknown"), false)
+  assert.equal(s.current?.sessionID, "ses_b")
+})
+
+test("share state: stopOne removes one and active falls back by share order", () => {
+  const s = new ShareStateManager()
+  s.share("ses_a", "chat_1")
+  s.share("ses_b", "chat_1")
+  s.share("ses_c", "chat_1")
+  s.setActive("ses_c")
+  const r = s.stopOne("ses_c")
+  assert.equal((r as { wasActive: boolean }).wasActive, true)
+  assert.equal((r as { remaining: number }).remaining, 2)
+  assert.equal(s.current?.sessionID, "ses_a", "active falls back to earliest remaining in share order")
+  assert.equal(s.isShared("ses_c"), false)
+  // 停止非 active 会话不影响 active
+  s.stopOne("ses_b")
+  assert.equal(s.current?.sessionID, "ses_a")
+  const r2 = s.stopOne("ses_unknown")
+  assert.equal((r2 as { was: unknown }).was, null)
+})
+
+test("share state: stopAll clears everything", () => {
+  const s = new ShareStateManager()
+  s.share("ses_a", "chat_1")
+  s.share("ses_b", "chat_1")
+  const r = s.stopAll()
   assert.equal(r.ok, true)
   assert.equal((r as { was: unknown }).was !== null, true)
   assert.equal(s.status, "unshared")
-  assert.equal(s.isShared("ses_a"), false)
+  assert.equal(s.count, 0)
+  assert.equal(s.current, null)
 })
 
-test("share state: routeCommand only allows shared session", () => {
+test("share state: routeCommand allows any shared session", () => {
   const s = new ShareStateManager()
   s.share("ses_a", "chat_1")
+  s.share("ses_b", "chat_1")
   assert.equal(s.routeCommand("ses_a"), true)
-  assert.equal(s.routeCommand("ses_b"), false)
-  s.stop()
+  assert.equal(s.routeCommand("ses_b"), true)
+  assert.equal(s.routeCommand("ses_c"), false)
+  s.stopAll()
   assert.equal(s.routeCommand("ses_a"), false)
 })
 

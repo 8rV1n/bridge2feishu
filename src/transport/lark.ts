@@ -242,7 +242,15 @@ export class LarkTransport implements FeishuTransport {
             respCard = renderCustomAnswerFormCard(cmd.requestID)
             toast = undefined
           } else {
-            respCard = renderStreamingCard(cmd.action === "permission_reply" ? "⏳ 正在处理审批…" : "⏳ 正在提交回答…", "操作已收到，正在执行…", "grey")
+            const ackText =
+              cmd.action === "permission_reply"
+                ? "⏳ 正在处理审批…"
+                : cmd.action === "question_reply"
+                  ? "⏳ 正在提交回答…"
+                  : cmd.action === "session_switch"
+                    ? "⏳ 正在切换会话…"
+                    : "⏳ 正在处理操作…"
+            respCard = renderStreamingCard(ackText, "操作已收到，正在执行…", "grey")
           }
           // 异步执行业务（回复/置灰由 onCardAction 回调完成）
           queueMicrotask(() => this.cardActionHandler?.(effValue, ctx, ctx.messageID))

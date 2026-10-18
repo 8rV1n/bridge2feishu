@@ -89,5 +89,8 @@ TUI 内菜单项（`/feishu`）：
 不冲突。本插件的分享是「飞书通道绑定」，与官方 share URL 无关；你的 opencode.json 中 `share: "disabled"` 也不受影响。
 
 **Q: 支持多个 TUI 同时分享吗？**
-每个 TUI 进程的插件实例独立绑定自己的 session 与飞书目标；互不干扰。
-但同一个飞书群会收到多个 TUI 的通知（以会话标题区分）。
+支持（0.2.0 起）。飞书长连接同一 App 只允许一条连接收事件（多条会把指令随机分流），插件用
+「leader/follower 本地中继」解决：先分享的 TUI 当 leader 独占连接，后分享的 TUI 自动降为
+follower、经本地中继文件把卡片泵给 leader；飞书 `/session` 聚合所有 TUI 的会话，`/session <n>`
+跨 TUI 切换；leader 关闭后其余 TUI 自动接管。前提：所有 TUI 在**同一台机器**且共享
+`FEISHU_SHARE_STATE_DIR`（默认同一目录即可）。跨机器场景请为各机器配置不同的 `FEISHU_APP_ID`。

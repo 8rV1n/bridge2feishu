@@ -1,7 +1,9 @@
 # opencode-feishu-share
 
-OpenCode 原生 TUI 插件：把**当前正在运行的 OpenCode Session** 一键分享到飞书，实现双向交互——
+OpenCode 原生 TUI 插件：把**正在运行的 OpenCode Session** 一键分享到飞书，实现双向交互——
 飞书接收任务状态/结果/待审批通知，并可以直接在飞书里发 Prompt、批准权限、回答问题、停止任务。
+支持**多个 TUI 进程并行分享**（先分享的 TUI 自动成为 leader 独占飞书连接，后续 TUI 经本地中继接入，
+互不影响），并在飞书端用 `/session` 查看/切换当前会话。
 
 - 不修改 OpenCode 内核，不需要额外进程，不需要公网端口
 - 飞书侧使用官方 SDK + WebSocket 长连接
@@ -12,9 +14,9 @@ OpenCode 原生 TUI 插件：把**当前正在运行的 OpenCode Session** 一�
 
 | 方向 | 能力 |
 |---|---|
-| TUI → 飞书 | 分享开启/关闭、会话快照、**流式任务卡**（开始→实时刷新→完成/失败定格）、限流重试提示、权限待审批（**按钮直批**）、Agent 提问（**按钮/表单直答**，支持多问题/多选/自定义答案输入框）、TUI 本地输入镜像、`/status` 查询回复 |
-| 飞书 → TUI | 直接发文本 = 发 prompt（busy 时插件排队）、`/run` `/steer`、`/status`、`/recent`、`/stop`、`/approve` `/deny`（权限审批）、`/answer`（回答提问）、`/model` `/agent`（查看/切换模型与 Agent）、`/disconnect`；卡片按钮/表单点击等效指令 |
-| 生命周期 | 会话级分享状态机；stop 不中止本地任务；TUI 退出自动清理；重连去重防重放 |
+| TUI → 飞书 | 分享开启/关闭、会话快照、**流式任务卡**（开始→实时刷新→完成/失败定格，多会话并发互不干扰）、限流重试提示、权限待审批（**按钮直批**）、Agent 提问（**按钮/表单直答**，支持多问题/多选/自定义答案输入框）、TUI 本地输入镜像、`/status` 查询回复、多会话接入提醒/列表/切换卡 |
+| 飞书 → TUI | 直接发文本 = 发 prompt（busy 时插件排队）、`/run` `/steer`、`/status`、`/recent`、`/stop`、`/approve` `/deny`（权限审批）、`/answer`（回答提问）、`/model` `/agent`（查看/切换模型与 Agent）、`/session` `/session <n>`（查看/切换当前会话）、`/disconnect [all]`；卡片按钮/表单点击等效指令 |
+| 生命周期 | 多 TUI/多会话分享状态机；第一个分享的会话自动成为默认会话，后续分享不抢占（仅提醒）；`/disconnect` 只断当前会话，最后一个断开才关连接；leader TUI 退出后其他 TUI 自动接管连接；stop 不中止本地任务；TUI 退出自动清理；重连去重防重放 |
 
 ## 快速开始
 
@@ -57,6 +59,7 @@ OpenCode 原生 TUI 插件：把**当前正在运行的 OpenCode Session** 一�
 - 任务执行中一张卡片流式刷新（工具时间线、思考中、正文 `▌`），完成后原地定格绿色；失败变红
 - 权限审批/Agent 提问卡片上直接点按钮即可批复/作答；多问题与多选走表单；「✍️ 其他答案」原地变输入框
 - 回答后 agent 继续产出时自动开**新卡片**展示后续回复（旧卡定格，保证时间线可读）
+- **多会话**：任何 TUI（无论第几个）分享后，后续会话接入都会发提醒卡（不打断当前会话）；`/session` 查看列表（★ 为当前，跨 TUI 聚合）；`/session <n>` 切换，切换卡三段式——切换提醒 + 会话概览 + 最近一次交互；后台会话的事件卡标题带（后台）标记
 
 ## 安全模型（单用户）
 
@@ -71,9 +74,9 @@ OpenCode 原生 TUI 插件：把**当前正在运行的 OpenCode Session** 一�
 
 ```
 src/
-  index.ts          插件入口（tui 导出）：命令注册、事件订阅、生命周期、流式任务卡状态机、入站命令处理
+  index.ts          插件入口（tui 导出）：命令注册、事件订阅、生命周期、流式任务卡状态机（按 session 隔离）、入站命令处理
   config.ts         环境变量配置加载
-  share-state.ts    会话级分享状态机（unshared/shared/routeCommand）
+  share-state.ts    多会话分享状态机（targets/activeSessionID/share 顺序/单停/全停）
   security.ts       白名单 + 审计日志
   router.ts         飞书文本/卡片按钮 → 指令解析（纯文本即 prompt）
   renderer.ts       通知渲染为飞书 JSON 2.0 交互卡片（markdown/表格/按钮/表单、超长分段）
@@ -88,10 +91,23 @@ docs/               可行性、PoC 记录、架构、安装、飞书配置、�
 scripts/            E2E expect 驱动脚本
 ```
 
+## 多 TUI 协作（leader / follower）
+
+飞书长连接模式同一 App 只允许一条连接接收事件（多条连接会把指令随机分流）。本插件用
+「leader + follower 中继」解决多个 TUI 并行分享：
+
+- **首个分享的 TUI 成为 leader**：独占飞书 WS 连接，并充当中继枢纽（非独立进程）
+- **之后分享的 TUI 自动成为 follower**：不建 WS，卡片操作经共享 stateDir 的本地中继文件
+  （`<stateDir>/relay/`）泵给 leader 发往飞书；飞书指令由 leader 按当前会话派发给属主 TUI
+- **飞书侧 `/session` 跨 TUI 聚合**：`/session <n>` 可切换到任意 TUI 的会话；切换卡的历史概览
+  由属主 TUI 同步
+- **leader TUI 退出**：其余 TUI 自动抢锁接管连接，分享不中断
+- 前提：所有 TUI 在同一台机器、共享 `FEISHU_SHARE_STATE_DIR`；跨机器不适用
+
 ## 测试
 
 ```bash
-npm test        # 73 个自动化测试（单元 + fake-api 集成）
+npm test        # 94 个自动化测试（单元 + fake-api 集成 + 跨 TUI 中继集成）
 npm run typecheck
 ```
 
